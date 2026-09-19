@@ -1,0 +1,39 @@
+{
+  "name": "qw-edit",
+  "version": "0.1.0",
+  "description": "为千问办公 (QwenWork) macOS 客户端加上「编辑已发消息」能力 —— CDP 注入，不修改客户端本体，更新免疫",
+  "type": "module",
+  "bin": {
+    "qw-edit": "bin/qw-edit.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "author": "yamingmou",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yamingmou/qw-edit.git"
+  },
+  "homepage": "https://github.com/yamingmou/qw-edit#readme",
+  "bugs": {
+    "url": "https://github.com/yamingmou/qw-edit/issues"
+  },
+  "scripts": {
+    "test": "node test/selftest.mjs",
+    "test:release": "node test/selftest.mjs --release"
+  },
+  "keywords": [
+    "qwenwork",
+    "qwen",
+    "electron",
+    "chrome-devtools-protocol",
+    "cdp",
+    "userscript",
+    "macos"
+  ]
+}
