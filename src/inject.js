@@ -392,12 +392,12 @@
       opacity:0;transition:opacity .15s}
     .${BTN_EDIT}{background:rgba(59,130,246,.92)}
     .${BTN_REGEN}{background:rgba(139,92,246,.92)}
-    /* 输出末尾的重新生成：随内容流动（非绝对定位），悬停整条消息时显示 */
-    .${BTN_REGEN_END}{display:inline-flex;align-items:center;gap:4px;margin-top:6px;
-      padding:4px 10px;border-radius:6px;color:#fff;font-size:11px;line-height:1;
-      border:none;box-shadow:0 1px 4px rgba(0,0,0,.35);background:rgba(139,92,246,.92);
-      opacity:0;transition:opacity .15s;cursor:pointer}
-    .qw-user-msg:hover>.${BTN_EDIT}, .qw-assist-msg:hover>.${BTN_REGEN}, .qw-assist-msg:hover .${BTN_REGEN_END}{opacity:1}
+    /* 回退用浮动图标（官方行未渲染时）：消息右下角的小圆图标 */
+    .${BTN_REGEN_END}{position:absolute;right:8px;bottom:8px;z-index:9999;
+      width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+      border-radius:8px;color:#fff;border:none;box-shadow:0 1px 4px rgba(0,0,0,.35);
+      background:rgba(139,92,246,.92);opacity:0;transition:opacity .15s;cursor:pointer}
+    .qw-user-msg:hover>.${BTN_EDIT}, .qw-assist-msg:hover>.${BTN_REGEN}, .qw-assist-msg:hover>.${BTN_REGEN_END}{opacity:1}
   `;
   document.head.appendChild(style);
   function makeButton(cls, label, title, onClick) {
@@ -413,14 +413,35 @@
     if (getComputedStyle(container).position === "static") container.style.position = "relative";
     container.appendChild(makeButton(cls, label, title, onClick));
   }
-  /* 输出末尾的重新生成：插到消息容器最后一个子元素之后（随内容流动，
-   * 看完长回答不用滚回顶部） */
+  /* 输出下方官方按钮行的「重新生成」：贴进那一行（复制/满意/不满意 同一行）末尾，
+   * 做成同款 icon 按钮（↻ 字形 + 克隆兄弟按钮样式，与官方融为一体）。
+   * 返回 true=已入行；false=该行不存在（如流式中），调用方回退到浮动图标。 */
+  function mountRegenRow(el) {
+    const stray = el.querySelector("." + BTN_REGEN_END);
+    if (el.querySelector('[data-qw-regen="1"]')) { if (stray) stray.remove(); return true; }
+    const ref0 = el.querySelector('button[aria-label="满意"], button[aria-label="复制文本"], button[aria-label="不满意"]');
+    const row = ref0?.closest("div.flex.items-center");
+    if (!row) return false;
+    if (stray) stray.remove(); // 官方行已出现，移除浮动回退，避免重复
+    const ref = row.querySelector("button");
+    const wrap = document.createElement("span");
+    wrap.className = "block";
+    const btn = document.createElement("button");
+    if (ref) btn.className = ref.className; else btn.className = BTN_REGEN_END;
+    btn.setAttribute("aria-label", "重新生成");
+    btn.title = "重新生成";
+    btn.dataset.qwRegen = "1";
+    btn.innerHTML = '<span style="font-size:15px;line-height:1">↻</span>';
+    btn.onclick = (ev) => { ev.stopPropagation(); onRegen(btn, el); };
+    row.appendChild(wrap); wrap.appendChild(btn);
+    return true;
+  }
+  /* 回退用：消息末尾的浮动重新生成（官方行还没渲染时，如流式中） */
   function mountRegenEnd(container) {
-    // 复用顶部按钮的点击逻辑；末尾按钮标识不同 class 以免 mountButton 去重
     if (container.querySelector("." + BTN_REGEN_END)) return;
     const btn = document.createElement("button");
     btn.className = BTN_REGEN_END;
-    btn.textContent = "↻ 重新生成";
+    btn.innerHTML = '<span style="font-size:15px;line-height:1">↻</span>';
     btn.title = "重新生成";
     btn.onclick = (ev) => { ev.stopPropagation(); onRegen(btn, container); };
     container.appendChild(btn);
@@ -448,6 +469,7 @@
     return null;
   }
   async function onEdit(btn, bubble) {
+    const _html = btn.innerHTML; // 保存原始内容，结束时原样恢复（修文字标签丢失 bug）
     btn.disabled = true; btn.textContent = "…";
     try {
       const ordinal = bubbleOrdinal(bubble, 'div[class*="container/user-message"]');
@@ -477,7 +499,7 @@
     } catch (e) {
       fail(e);
     } finally {
-      btn.disabled = false; btn.textContent = "✎";
+      btn.disabled = false; btn.innerHTML = _html;
     }
   }
 
@@ -487,6 +509,7 @@
     return (pure ?? el).textContent || "";
   }
   async function onRegen(btn, bubble) {
+    const _html = btn.innerHTML; // 保存原始内容，结束时原样恢复（修文字标签丢失 bug）
     btn.disabled = true; btn.textContent = "…";
     try {
       const ordinal = bubbleOrdinal(bubble, 'div[class*="container/assistant-message"]');
@@ -534,7 +557,7 @@
     } catch (e) {
       fail(e);
     } finally {
-      btn.disabled = false; btn.textContent = "↻";
+      btn.disabled = false; btn.innerHTML = _html;
     }
   }
 
@@ -559,8 +582,9 @@
     }
     for (const b of document.querySelectorAll('div[class*="container/assistant-message"]')) {
       b.classList.add("qw-assist-msg");
-      mountButton(b, BTN_REGEN, "↻ 重新生成", "重新生成", onRegen);
-      mountRegenEnd(b); // 输出末尾也放一个，看完长回答不用滚回顶部
+      mountButton(b, BTN_REGEN, "↻ 重新生成", "重新生成", onRegen); // 顶部保留（文字，方便发现）
+      // 底部：贴进输出下方官方按钮行做 icon；该行未渲染时回退到末尾浮动 icon
+      if (!mountRegenRow(b)) mountRegenEnd(b);
     }
   }
 
@@ -571,5 +595,5 @@
     firstTurnReinit, rebindView, sidebarItemsByName,
   };
   setInterval(mountButtons, 1500);
-  log("v9.5 loaded (text buttons + end-of-output regen). 调试入口: window.__qwEdit");
+  log("v9.6 loaded (in-row regen icon + label-loss fix). 调试入口: window.__qwEdit");
 })();
