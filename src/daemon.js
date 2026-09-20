@@ -7,12 +7,12 @@
  * 生命周期（配合 launchd KeepAlive + ThrottleInterval）：
  *  - 客户端未运行 → 立即退出（launchd 每 10s 拉起做一次毫秒级检查，机器上无常驻进程）
  *  - 客户端运行且带调试端口 → 常驻，注入并保持
- *  - 客户端运行但无端口 → takeover：带端口重启一次（config.takeover 可关）
+ *  - 客户端运行但无端口 → 弹询问框，用户同意才带端口重启（拒绝则本次运行不再问）
  *  - 客户端退出（CDP 消失）→ 退出，等 launchd 下轮拉起
  */
 import { readFile, readdir, stat as statFile } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
@@ -23,6 +23,7 @@ const APP_NAME = "QwenWorkCN"; // macOS 应用进程名（pgrep -x 精确匹配�
 const MARKER = path.join(tmpdir(), "qw-edit-relaunch.marker");
 const CONFIG_PATH = path.join(homedir(), ".qw-edit", "config.json");
 const INJECT_PATH = new URL("./inject.js", import.meta.url);
+const LOCK_PATH = path.join(homedir(), ".qw-edit", "daemon.lock");
 
 const config = { takeover: true, maxFailedTakeovers: 3 };
 try { Object.assign(config, JSON.parse(readFileSync(CONFIG_PATH, "utf8"))); } catch {}
@@ -58,28 +59,113 @@ async function cdpUp() {
   } catch { return false; }
 }
 
-/* ---------- takeover：无端口运行 → 自动带端口重启 ---------- */
-async function maybeTakeover() {
+/* ---------- takeover：无端口运行 → 询问用户，同意才重启加载 ----------
+ * 不再擅自重启。检测到"客户端在跑但没带调试端口"时弹系统询问框：
+ *   立即重启 → 结束无端口实例并带端口重开（用户已明确同意，直接结束，
+ *              不再走会二次弹"确认退出"框的优雅退出）
+ *   暂不     → 本次运行期间不再询问（按进程组记忆，尊重用户选择）
+ * 60 秒无响应视为"暂不"。 */
+const ASKED_PATH = path.join(homedir(), ".qw-edit", "asked.json");
+let askedRuns = {};
+try { askedRuns = JSON.parse(readFileSync(ASKED_PATH, "utf8")) || {}; } catch {}
+
+/* 原子写（tmp+rename）：进程中断不会留下半截文件 */
+function atomicWrite(file, data) {
+  const tmp = `${file}.tmp.${process.pid}`;
+  writeFileSync(tmp, data);
+  renameSync(tmp, file);
+}
+const askedFileWrite = () => { try { atomicWrite(ASKED_PATH, JSON.stringify(askedRuns)); } catch {} };
+
+/* 单实例锁：防止 launchd 拉起第二个 daemon 叠加弹框；持有 osascript 引用，
+ * daemon 退出时清理孤儿弹框 */
+const acquireLock = () => {
+  try {
+    if (existsSync(LOCK_PATH)) {
+      const pid = Number(readFileSync(LOCK_PATH, "utf8"));
+      if (pid && pid !== process.pid) {
+        try { process.kill(pid, 0); return false; }      // 存活实例持有锁
+        catch (e) { if (e.code !== "ESRCH") return false; } // EPERM 也视为存活
+      }
+    }
+    atomicWrite(LOCK_PATH, String(process.pid));
+    return true;
+  } catch { return false; }
+};
+const releaseLock = () => {
+  try {
+    if (readFileSync(LOCK_PATH, "utf8") === String(process.pid)) unlinkSync(LOCK_PATH);
+  } catch {}
+};
+let currentAskChild = null;
+const killOrphanDialog = () => { try { currentAskChild?.kill("SIGKILL"); } catch {} currentAskChild = null; };
+process.on("exit", releaseLock);
+process.on("SIGTERM", () => { killOrphanDialog(); releaseLock(); process.exit(0); });
+process.on("SIGINT", () => { killOrphanDialog(); releaseLock(); process.exit(0); });
+
+function runKey(pids) { return pids.slice().sort().join(","); }
+
+function askRestartDialog() {
+  // 非阻塞 spawn：弹框期间轮询不能停摆；90s 兜底超时防 osascript 意外挂起
+  return new Promise((resolve) => {
+    let done = false;
+    const script =
+      'display dialog "「编辑撤回 / 重新生成」尚未加载到千问办公。" & return & ' +
+      '"需要重启千问办公来加载（正在运行的任务会被中断）。" & return & return & ' +
+      '"选「暂不」则本次运行不再询问。" with title "qw-edit 加载器" buttons {"暂不", "立即重启"} default button "暂不" cancel button "暂不" giving up after 60';
+    const child = spawn("osascript", ["-e", script]);
+    currentAskChild = child;
+    let out = "", err = "";
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 90_000);
+    const finish = (v) => { if (done) return; done = true; clearTimeout(timer); if (currentAskChild === child) currentAskChild = null; resolve(v); };
+    child.stdout?.on("data", (d) => { out += d; });
+    child.stderr?.on("data", (d) => { err += d; });
+    child.on("close", (code) => {
+      finish(code === 0 && out.includes("立即重启"));
+      if (!done) return;
+    });
+    child.on("error", (e) => { log("ask dialog 启动失败:", e.message); finish(false); });
+  });
+}
+
+async function maybeAskTakeover() {
   if (!config.takeover || failedTakeovers >= (config.maxFailedTakeovers ?? 3)) return;
-  const pids = appPids();
+  let pids = appPids();
   if (!pids.length || (await cdpUp())) return;
   const uptime = Math.min(...pids.map(appUptime));
-  if (uptime < 4) return;                            // 刚启动，稍等
-  if (Date.now() - lastRelaunchAt < 30_000) return;   // 防重启风暴
-  log(`客户端已运行 ${uptime}s 但无 CDP 端口，带端口重启…`);
-  try { execFileSync("osascript", ["-e", `quit app "${APP_NAME}"`]); } catch {}
-  for (let i = 0; i < 30 && appPids().length; i++) await sleep(1000);
-  await sleep(2);
+  if (uptime < 4) return;                             // 刚启动，稍等
+  if (Date.now() - lastRelaunchAt < 30_000) return;   // 防风暴
+  const key = runKey(pids);
+  // asked.json 清理：超过 30 天的记录过期（防无限增长）
+  const nowTs = Date.now();
+  for (const k of Object.keys(askedRuns)) {
+    if (nowTs - askedRuns[k] > 30 * 24 * 3600 * 1000) delete askedRuns[k];
+  }
+  if (askedRuns[key]) return;                         // 本次运行已问过/已拒绝，尊重用户
+  if (asking) return;
+  asking = true;
   try {
-    execFileSync("open", ["-a", APP_NAME, "--args", `--remote-debugging-port=${CDP_PORT}`]);
-  } catch (e) { log("relaunch failed:", e.message); return; }
-  lastRelaunchAt = Date.now();
-  try { writeFileSync(MARKER, String(lastRelaunchAt)); } catch {}
-  // 60s 内 CDP 未就绪视为失败，累计防风暴
-  setTimeout(async () => {
-    if (await cdpUp()) { failedTakeovers = 0; log("takeover 成功，CDP 就绪"); }
-    else { failedTakeovers++; log(`takeover 后 CDP 未就绪（第 ${failedTakeovers} 次失败）`); }
-  }, 60_000);
+    log(`客户端已运行 ${uptime}s 但无 CDP 端口，询问用户是否重启加载…`);
+    const yes = await askRestartDialog();
+    askedRuns[key] = Date.now(); askedFileWrite();    // 无论选什么，本次运行不再问
+    if (!yes) { log("用户选择暂不重启，本次运行不再询问"); return; }
+    // 用户同意：重新采样（弹框 60s 内状态可能已变——pid 复用/用户已自己重启等）
+    pids = appPids();
+    if (!pids.length) { log("用户同意时客户端已退出，跳过"); return; }
+    if (await cdpUp()) { log("用户同意时客户端已带端口，无需重启"); return; }
+    log("用户同意重启，结束无端口实例并带端口重开…");
+    for (const pid of pids) { try { process.kill(Number(pid), "SIGKILL"); } catch {} }
+    for (let i = 0; i < 20 && appPids().length; i++) await sleep(500);
+    await sleep(1000); // 给 LaunchServices 一点收尾时间
+    try { execFileSync("open", ["-a", APP_NAME, "--args", `--remote-debugging-port=${CDP_PORT}`]); }
+    catch (e) { log("relaunch failed:", e.message); return; }
+    lastRelaunchAt = Date.now();
+    try { atomicWrite(MARKER, String(lastRelaunchAt)); } catch {}
+    setTimeout(async () => {
+      if (await cdpUp()) { failedTakeovers = 0; log("takeover 成功，CDP 就绪"); }
+      else { failedTakeovers++; log(`takeover 后 CDP 未就绪（第 ${failedTakeovers} 次失败）`); }
+    }, 60_000);
+  } finally { asking = false; }
 }
 
 /* ---------- CDP 注入 ---------- */
@@ -275,6 +361,8 @@ async function pollOps() {
 
 /* ---------- 主循环：生命周期跟随客户端 ---------- */
 async function main() {
+  // 单实例锁：已有一个活着的 daemon 时本实例立即退出（防叠框、防重复接管）
+  if (!acquireLock()) { log("已有 daemon 实例在运行，本实例退出"); process.exit(0); }
   log(`qw-edit daemon started (takeover=${config.takeover})`);
   // 初始检查：客户端没跑就立即退出（launchd 节流拉起，常态零占用）
   if (!appPids().length && !(await cdpUp())) {
@@ -293,9 +381,9 @@ async function main() {
           injectIntoTarget(t).catch(() => {});
         }
       } else {
-        // CDP 没起来：要么 app 没跑，要么需要 takeover，要么正处重启间隙
+        // CDP 没起来：要么 app 没跑，要么需要询问重启，要么正处重启间隙
         if (appPids().length) {
-          await maybeTakeover();
+          await maybeAskTakeover();
           cdpDownSince = 0; // app 还在，继续守
         } else if (cdpDownSince === 0) {
           cdpDownSince = Date.now();

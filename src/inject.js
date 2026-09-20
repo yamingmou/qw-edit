@@ -479,6 +479,8 @@
       const { msg, all, chat, sub } = hit;
       const anchor = anchorBefore(all, msg.sequence);
       if (anchor) {
+        // 二次确认：回退是破坏性操作（锚点之后的内容从会话移除），防误点
+        if (!confirm("[qw-edit] 将回退到这条消息之前：\n它之后的所有消息（含回答）会从本会话移除（磁盘原文件保留作审计），原输入会放回输入框供你修改重发。\n\n继续？")) return;
         btn.textContent = "…";
         const r = await withLock(sub.id, () =>
           trueRollback({ subChatId: sub.id, anchor, all, forbiddenTexts: [msg.text] }));
@@ -524,6 +526,8 @@
       const anchor = anchorBefore(all, userMsg.sequence);
       let targetSub = sub.id, targetChat = chat.id;
       if (anchor) {
+        // 二次确认：回退 + 自动重发是破坏性操作（锚点之后的内容从会话移除），防误点
+        if (!confirm("[qw-edit] 将回退到该回答之前并重新生成：\n该回答及之后的内容会从本会话移除（磁盘原文件保留作审计），并用原提问自动重新发送（消耗一次模型调用）。\n\n继续？")) return;
         btn.textContent = "…";
         // forbidden 只放被撤回轮的用户消息文本。锚点回答必须保留在遮蔽文件里，
         // 不加入 forbidden（锚点与被撤回回答文本相同时会误拦）
