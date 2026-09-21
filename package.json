@@ -1,7 +1,7 @@
 {
   "name": "qw-edit",
-  "version": "0.2.0",
-  "description": "为千问办公 (QwenWork) macOS / Windows 客户端加上「编辑已发消息」能力 —— CDP 注入，不修改客户端本体，更新免疫",
+  "version": "0.3.0",
+  "description": "为千问办公 (QwenWork) macOS / Windows 客户端加上「编辑撤回 / 重新生成 / 消息时间」能力 —— CDP 注入，不修改客户端本体，更新免疫",
   "type": "module",
   "bin": {
     "qw-edit": "bin/qw-edit.js"

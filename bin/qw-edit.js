@@ -208,7 +208,7 @@ function setTakeover(on) {
 }
 
 function usage() {
-  console.log(`qw-edit v${VERSION} — 千问办公「编辑已发消息」增强
+  console.log(`qw-edit v${VERSION} — 千问办公「编辑撤回 / 重新生成 / 消息时间」增强
 
 用法:
   qw-edit install    安装并启动（macOS: launchd；Windows: 任务计划）

@@ -389,27 +389,102 @@ function normForkText(s) {
     .replace(/\s+/g, " ")
     .trim();
 }
+/* 展开 UI 侧的提及语法 @[folder:local:C:\path] → C:\path（转录里存的是展开后的原文，
+ * 投影 msg.text 里是包装形态，两边匹配前必须先统一）。可选前缀只认 local:
+ * （写成 [a-z]+: 会误吃 Windows 盘符 C:）。 */
+function unwrapMentions(s) {
+  return (s || "").replace(/@\[([a-z-]+):(?:local:)?([^\]]*)\]/gi, "$2");
+}
+/* user 行的文本：content 可能是字符串或块数组；块数组取全部 text 块拼接
+ * （真实提问是最后一个 text 块，前面可能跟着 <system-reminder> 包裹段）。 */
+function userLineText(obj) {
+  const c = obj?.message?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.filter((p) => p?.type === "text" && typeof p.text === "string").map((p) => p.text).join("");
+  return "";
+}
+function userLineLastText(obj) {
+  const c = obj?.message?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) {
+    const t = c.filter((p) => p?.type === "text" && typeof p.text === "string").map((p) => p.text);
+    return t.length ? t[t.length - 1] : "";
+  }
+  return "";
+}
+/* 匹配「被撤回的用户提问」对应的转录 user 行下标（纯函数，可离线测试）。
+ * pass 1（最强）：行内最后一个 text 块 === 提问（真实提问行的形态，前面可能
+ * 跟着 <system-reminder> 包裹段）；pass 2（兜底）：行文本包含提问
+ * （斜杠命令 / 其它包装格式）。两 pass 均取**全部**命中，调用方取最后一个
+ * （同文提问取最近一次，与 onRegen 语义一致；宁可截晚不可截早——截晚
+ * shadow ⊇ 投影，安全方向）。 */
+function matchUserLineIdxs(objs, stopBeforeUserText) {
+  const normP = normForkText(unwrapMentions(stopBeforeUserText));
+  if (!normP) return [];
+  const isUser = (o) => o?.type === "user" && o.isSidechain !== true;
+  const exact = [], loose = [];
+  objs.forEach((o, i) => {
+    if (!isUser(o)) return;
+    if (normForkText(unwrapMentions(userLineLastText(o))) === normP) exact.push(i);
+    const lt = normForkText(unwrapMentions(userLineText(o)));
+    if (lt && (lt.includes(normP) || normP.includes(lt))) loose.push(i);
+  });
+  return exact.length ? exact : loose;
+}
+/* 主锚定（纯函数，可离线测试）：给定已解析的转录行与「被撤回的用户提问」文本，
+ * 返回 { cut, u }（u = 定位到的提问行下标，cut = 截断点 = u-1），找不到返回 null。
+ * 语义即「回退到这次提问之前」——投影把两轮 user 之间的全部转录组（含纯工具
+ * 调用轮）合并成一条 assistant 消息，序数与拼接文本都对不上转录组，唯有
+ * 「按提问定位」天然精确。 */
+function locateStopBeforeAnchor(objs, stopBeforeUserText) {
+  const hits = matchUserLineIdxs(objs, stopBeforeUserText);
+  if (!hits.length) return null;
+  const u = hits[hits.length - 1];
+  if (u <= 0) return null;
+  // 前面必须真有过 assistant 内容（首轮无锚点，由调用方走 firstTurnReinit）
+  for (let i = 0; i < u; i++) {
+    if (objs[i]?.type === "assistant" && objs[i].isSidechain !== true) {
+      // 截断点 = 提问行的**前一行**：整轮内容完整保留。不能截在「最后一条
+      // assistant 行」——被中断的轮次末尾可能还跟着 tool_result 行（user 型），
+      // 截掉会留下悬空 tool_use，破坏投影 ⊆ 遮蔽不变量（客户端会补偿注入历史）。
+      return { cut: u - 1, u };
+    }
+  }
+  return null;
+}
+/* forbidden 校验（纯函数，可离线测试）：被撤回文本不得出现在遮蔽区内。
+ * scopeFrom > 0 时只检查该行之后（提问锚定路径：被撤回提问合法地可能更早
+ * 同文出现过，只需检查「遮蔽区内最后一个匹配提问行之后」是否仍出现——
+ * 那才是截断错位的信号；更早出现的是应保留的历史）。 */
+function findForbiddenViolations(lineTexts, forbidden, scopeFrom = 0) {
+  const violations = [];
+  const body = lineTexts.slice(scopeFrom).join("\n");
+  for (const t of forbidden) {
+    const chunk = (t || "").replace(/\s+/g, " ").replace(/["\\]/g, "").trim().slice(0, 30);
+    if (chunk && body.includes(chunk)) violations.push(chunk.slice(0, 12) + "…");
+  }
+  return violations;
+}
 /**
  * 遮蔽截断：读原转录 → 定位锚点行（uuid 优先，规范化文本兜底）
  * → 写 <newSessionId>.jsonl（锚点行及之前，行内 sessionId 替换）→ 验证。
  * 原文件不动（审计轨迹）。任何失败：不产生重指后果，遮蔽文件留作惰性孤儿（无害）。
  */
-async function shadowTruncate({ sessionId, newSessionId, anchorOrdinal, anchorText, forbidden = [] }) {
+async function shadowTruncate({ sessionId, newSessionId, anchorOrdinal, anchorText, anchorMessageId, stopBeforeUserText, stopBeforeTime, forbidden = [] }) {
   if (!/^[\w-]+$/.test(sessionId || "") || !/^[\w-]+$/.test(newSessionId || "")) {
     return { ok: false, error: "bad-session-id" };
   }
   const srcFile = await findSessionFile(sessionId);
   if (!srcFile) return { ok: false, error: "session-file-not-found" };
   const lines = (await readFile(srcFile, "utf8")).split("\n").filter(Boolean);
-  /* 定位锚点行。投影 metadata 的 sdkMessageUuid 与转录行 uuid 是两套 ID（无对应关系），
-   * 官方 fork 的文本兜底在多轮同文回答时会错位。但投影与转录是同一事件流的两个
-   * append-only 视图，顺序天然对齐：投影第 anchorOrdinal 条助手消息
-   * = 转录第 anchorOrdinal 组 assistant 行（按 message.id 分组，跳过 sidechain）。
-   * 截断点 = 该组末行。文本做软校验，不一致即中止（宁停不错）。 */
+  const objs = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } });
+  /* 转录 assistant 分组（同 message.id 连续行合为一组，跳过 sidechain）。
+   * 注意：投影把两轮 user 之间的全部组（含纯 thinking/tool_use 的空文本组）
+   * 合并成**一条** assistant 消息 → 投影侧的序数与拼接文本都对不上转录组。 */
   const groups = []; // { id, end, text }
   let cur = null;
   lines.forEach((l, i) => {
-    let obj; try { obj = JSON.parse(l); } catch { return; }
+    const obj = objs[i];
     if (obj?.type !== "assistant" || obj.isSidechain === true) { cur = null; return; }
     const id = obj?.message?.id ?? null;
     const c = obj?.message?.content;
@@ -417,17 +492,56 @@ async function shadowTruncate({ sessionId, newSessionId, anchorOrdinal, anchorTe
     if (cur && id !== null && cur.id === id) { cur.end = i; cur.text += texts.join(""); }
     else { cur = { id, end: i, text: texts.join("") }; groups.push(cur); }
   });
+  /* 定位锚点组（从精确到兜底）：
+   *   1) 【主路径】stopBeforeUserText（被撤回的用户提问）：在转录里定位该提问行
+   *      （末 text 块精确相等 → 包含匹配，均取最后一个），截断点 = 其前最后一条
+   *      assistant 行。语义即「回退到这次提问之前」，天然不受投影合并影响。
+   *      Windows v1.1.52 实测：投影消息 id（uuid）与转录 message.id（chatcmpl-x /
+   *      时间戳）是两套体系，且投影文本是多组拼接 → 旧三级锚定（messageId /
+   *      序数 / 唯一文本）全部失效，用户报「上下文截断失败」。
+   *   2) messageId 相等（未来版本若两边 ID 对齐则直接命中）；
+   *   3) 序数合法且文本一致（投影/转录组恰好对齐时的正常路径）；
+   *   4) 锚点文本唯一匹配（抗错位兜底；多匹配宁停不错）；
+   *   5) 全部失败 → 宁停不错。 */
   const ordinal = Number(anchorOrdinal);
-  if (!Number.isInteger(ordinal) || ordinal < 1 || ordinal > groups.length) {
-    return { ok: false, error: `anchor-ordinal-out-of-range (ordinal=${ordinal}, groups=${groups.length})` };
+  const softMatch = (a, b) => !!a && !!b && (a === b || a.includes(b) || b.includes(a));
+  let g = null, stopAnchor = null;
+  if (!g && stopBeforeUserText) {
+    const loc = locateStopBeforeAnchor(objs, stopBeforeUserText);
+    if (loc) { g = { end: loc.cut }; stopAnchor = loc; }
   }
-  const g = groups[ordinal - 1];
-  // 软校验：锚点组文本应与投影锚点文本一致（允许一方为空或互含）
-  if (anchorText) {
-    const a = normForkText(anchorText), b = normForkText(g.text);
-    if (a && b && a !== b && !a.includes(b) && !b.includes(a)) {
-      return { ok: false, error: "anchor-text-mismatch", projectionText: a.slice(0, 40), transcriptText: b.slice(0, 40) };
+  /* 时间戳回退（1b）：提问未在转录中定位到——实测（2026-09-21 20:32 轮）
+   * 客户端进程重启会导致个别轮次**只进投影、不落盘转录**。此时模型上下文
+   * 天然不含该轮（resume 只读转录），截断点 = 转录中最后一个 timestamp
+   * 早于提问发送时间的行（其后所有行——含新轮元数据——都属「该消息之后」）。 */
+  if (!g && stopBeforeTime) {
+    const cutMs = Date.parse(stopBeforeTime);
+    if (Number.isFinite(cutMs)) {
+      let cut = -1;
+      objs.forEach((o, i) => {
+        const t = o?.timestamp;
+        const ms = typeof t === "number" ? t : (typeof t === "string" ? Date.parse(t) : NaN);
+        if (Number.isFinite(ms) && ms < cutMs) cut = i;
+      });
+      if (cut >= 0) g = { end: cut };
     }
+  }
+  if (!g && anchorMessageId) {
+    g = groups.find((x) => x.id === anchorMessageId) ?? null;
+  }
+  if (!g && Number.isInteger(ordinal) && ordinal >= 1 && ordinal <= groups.length) {
+    const cand = groups[ordinal - 1];
+    if (!anchorText || softMatch(normForkText(anchorText), normForkText(cand.text))) g = cand;
+  }
+  if (!g && anchorText) {
+    const a = normForkText(anchorText);
+    if (a) {
+      const matched = groups.filter((x) => softMatch(a, normForkText(x.text)));
+      if (matched.length === 1) g = matched[0];
+    }
+  }
+  if (!g) {
+    return { ok: false, error: `anchor-not-located (ordinal=${ordinal}, groups=${groups.length}${anchorText ? ", 锚点文本未唯一命中" : ""}${stopBeforeUserText ? ", 提问未在转录中定位到" : ""})` };
   }
   const idx = g.end;
   const out = lines.slice(0, idx + 1).map((l) => l.split(sessionId).join(newSessionId));
@@ -435,13 +549,15 @@ async function shadowTruncate({ sessionId, newSessionId, anchorOrdinal, anchorTe
   try { await statFile(dest); return { ok: false, error: "dest-exists" }; } catch {}
   const { writeFile } = await import("node:fs/promises");
   await writeFile(dest, out.join("\n") + "\n", { mode: 0o644 });
-  // 验证：被撤回文本必须不在遮蔽文件里
-  const newContent = out.join("\n");
-  const violations = [];
-  for (const t of forbidden) {
-    const chunk = (t || "").replace(/\s+/g, " ").replace(/["\\]/g, "").trim().slice(0, 30);
-    if (chunk && newContent.includes(chunk)) violations.push(chunk.slice(0, 12) + "…");
+  // 验证：被撤回文本必须不在遮蔽文件里（提问锚定路径做作用域限定：
+  // 遮蔽区内最后一个匹配提问行之后才是「截断错位」的信号区，更早的同文
+  // 提问是应保留的历史，不算违规——否则同文重复提问会被误拦）
+  let scopeFrom = 0;
+  if (stopAnchor) {
+    const hitsInShadow = matchUserLineIdxs(objs.slice(0, idx + 1), stopBeforeUserText);
+    if (hitsInShadow.length) scopeFrom = hitsInShadow[hitsInShadow.length - 1] + 1;
   }
+  const violations = findForbiddenViolations(out, forbidden, scopeFrom);
   if (violations.length) return { ok: false, error: "forbidden-text-present", violations };
   return { ok: true, file: dest, lines: out.length, originalLines: lines.length };
 }

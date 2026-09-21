@@ -179,7 +179,7 @@ console.log("\n5. 文档");
   const must = [
     [/127\.0\.0\.1|本机其他程序|调试端口/, "调试端口的本机暴露面提示"],
     [/非官方|不是官方|无关联/, "非官方/免责声明"],
-    [/npm (i|install)|从 npm 安装/, "从 npm 安装的说明（占位亦可）"],
+    [/git clone|npm (i|install)/, "安装说明（源码 clone 或 npm 皆可）"],
   ];
   for (const [re, label] of must) {
     if (re.test(readme)) ok(`README 含：${label}`);
