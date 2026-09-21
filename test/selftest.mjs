@@ -33,7 +33,9 @@ function node(args, opts = {}) {
   return spawnSync(process.execPath, args, { cwd: ROOT, encoding: "utf8", ...opts });
 }
 function npm(args) {
-  return spawnSync("npm", args, { cwd: ROOT, encoding: "utf8" });
+  // Windows 下 npm 是 npm.cmd 批处理，必须 shell:true 才能 spawn；macOS/Linux 直接 spawn
+  const cmd = process.platform === "win32" ? "npm.cmd" : "npm";
+  return spawnSync(cmd, args, { cwd: ROOT, encoding: "utf8", shell: process.platform === "win32" });
 }
 
 console.log(`qw-edit selftest${RELEASE ? " [RELEASE GATE]" : ""} — root=${ROOT}\n`);

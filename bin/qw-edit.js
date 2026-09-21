@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 /**
- * qw-edit CLI —— 安装 / 卸载 / 状态管理
+ * qw-edit CLI —— 安装 / 卸载 / 状态管理（macOS + Windows）
  *
  * 用法：
- *   node bin/qw-edit.js install     安装并启动（launchd 常驻，随登录自启）
+ *   node bin/qw-edit.js install     安装并启动（macOS: launchd；Windows: 任务计划 + 隐藏窗口启动器）
  *   node bin/qw-edit.js uninstall   卸载
  *   node bin/qw-edit.js status      查看状态
  *   node bin/qw-edit.js enable|disable   开关 takeover（无端口启动时自动带端口重启）
+ *   node bin/qw-edit.js --version   打印版本
+ *   node bin/qw-edit.js --help      显示帮助
  */
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, writeFileSync, existsSync, readFileSync, renameSync } from "node:fs";
@@ -16,14 +18,32 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const DEST = path.join(homedir(), ".qw-edit");
-const LABEL = "com.qwedit.daemon";
-const UID = process.getuid();
+const LABEL = "com.qwedit.daemon";            // macOS launchd label
+const WIN_TASK = "qw-edit-daemon";            // Windows 任务计划名
+const VBS_PATH = path.join(DEST, "daemon-run.vbs");
+// process.getuid 仅 POSIX 可用（Windows 上不存在）——跨平台兼容
+const UID = typeof process.getuid === "function" ? process.getuid() : undefined;
 const PLIST = path.join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
 const CDP_PORT = 9222;
+const VERSION = JSON.parse(readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
+
+const IS_MAC = process.platform === "darwin";
+const IS_WIN = process.platform === "win32";
 
 function sh(cmd, args, { okFail = false } = {}) {
   try {
     return execFileSync(cmd, args, { stdio: ["ignore", "pipe", "inherit"] }).toString();
+  } catch (e) {
+    if (okFail) return "";
+    throw e;
+  }
+}
+/** Windows：跑一段 PowerShell（结构化操作，避免 schtasks 引号地狱） */
+function ps(script, { okFail = false } = {}) {
+  try {
+    return execFileSync("powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", script],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }).toString();
   } catch (e) {
     if (okFail) return "";
     throw e;
@@ -42,6 +62,13 @@ function agentState() {
   const pid = /pid = (\d+)/.exec(out)?.[1];
   return { loaded: /state =/.test(out), pid };
 }
+function winTaskRegistered() {
+  try { execFileSync("schtasks", ["/Query", "/TN", WIN_TASK, "/FO", "LIST"], { stdio: "ignore" }); return true; }
+  catch { return false; }
+}
+function daemonPid() {
+  try { return Number(readFileSync(path.join(DEST, "daemon.lock"), "utf8")) || null; } catch { return null; }
+}
 async function cdpUp() {
   try {
     const r = await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`, { signal: AbortSignal.timeout(1500) });
@@ -49,14 +76,52 @@ async function cdpUp() {
   } catch { return false; }
 }
 function appRunning() {
-  try { return sh("pgrep", ["-x", "QwenWorkCN"], { okFail: true }).trim().length > 0; }
-  catch { return false; }
+  try {
+    if (IS_WIN) {
+      const out = execFileSync("tasklist", ["/FI", "IMAGENAME eq QwenWorkCN.exe", "/FO", "CSV", "/NH"], { encoding: "utf8" });
+      return out.includes("QwenWorkCN.exe");
+    }
+    return sh("pgrep", ["-x", "QwenWorkCN"], { okFail: true }).trim().length > 0;
+  } catch { return false; }
 }
 
+/* ---------- 安装 ---------- */
+function installWin() {
+  mkdirSync(DEST, { recursive: true });
+  // 1) 隐藏窗口启动器：内嵌 node 与 daemon 的绝对路径（wscript 不依赖 PATH）
+  const vbs = `' qw-edit daemon 启动器 —— 由 qw-edit install 生成，请勿手改。
+' 用 wscript.exe 隐藏窗口运行 node daemon.js；任务计划程序每分钟拉起，无常驻进程。
+Set sh = CreateObject("WScript.Shell")
+sh.Run """${process.execPath}"" ""${path.join(DEST, "src", "daemon.js")}""", 0, False
+`;
+  writeFileSync(VBS_PATH, vbs, { encoding: "utf8" });
+  // 2) 注册任务计划：从现在起每 1 分钟重复（StartWhenAvailable 开机后自动补跑）
+  const script = `
+$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument '"${VBS_PATH}"'
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 1)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+Register-ScheduledTask -TaskName "${WIN_TASK}" -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+Start-ScheduledTask -TaskName "${WIN_TASK}"
+`;
+  ps(script);
+}
 function install() {
-  mkdirSync(path.join(DEST), { recursive: true });
+  mkdirSync(DEST, { recursive: true });
   cpSync(path.join(ROOT, "src"), path.join(DEST, "src"), { recursive: true });
   if (!existsSync(path.join(DEST, "config.json"))) writeConfig({ takeover: true });
+
+  if (IS_WIN) {
+    installWin();
+    console.log("✓ qw-edit 已安装并启动");
+    console.log("  生命周期跟随客户端：客户端运行时守护并注入，客户端退出后自动退出");
+    console.log("  （任务计划每 1 分钟拉起一次，机器上无常驻进程）");
+    console.log(`  安装目录: ${DEST}`);
+    console.log(`  日志:     ${DEST}/daemon.log`);
+    console.log("");
+    console.log("  客户端当前若未带调试端口运行，守护进程会自动带端口重启一次。");
+    return;
+  }
+  if (!IS_MAC) { console.error(`✗ 不支持当前平台: ${process.platform}`); process.exit(1); }
 
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -81,8 +146,8 @@ function install() {
   sh("launchctl", ["kickstart", `gui/${UID}/${LABEL}`], { okFail: true });
 
   console.log("✓ qw-edit 已安装并启动");
-  console.log(`  生命周期跟随客户端：客户端运行时守护并注入，客户端退出后自动退出`);
-  console.log(`  （launchd 每 10s 检查一次，机器上无常驻进程）`);
+  console.log("  生命周期跟随客户端：客户端运行时守护并注入，客户端退出后自动退出");
+  console.log("  （launchd 每 10s 检查一次，机器上无常驻进程）");
   console.log(`  安装目录: ${DEST}`);
   console.log(`  日志:     ${DEST}/daemon.log`);
   console.log("");
@@ -90,6 +155,14 @@ function install() {
 }
 
 function uninstall() {
+  if (IS_WIN) {
+    try { execFileSync("schtasks", ["/Delete", "/TN", WIN_TASK, "/F"], { stdio: "ignore" }); } catch {}
+    const pid = daemonPid();
+    if (pid) { try { execFileSync("taskkill", ["/F", "/PID", String(pid)], { stdio: "ignore" }); } catch {} }
+    console.log("✓ 已卸载任务计划（~/.qw-edit 目录保留，确认无需后可手动删除）");
+    return;
+  }
+  if (!IS_MAC) { console.error(`✗ 不支持当前平台: ${process.platform}`); process.exit(1); }
   sh("launchctl", ["bootout", `gui/${UID}/${LABEL}`], { okFail: true });
   if (existsSync(PLIST)) {
     // 不直接删除，归档到安装目录
@@ -99,8 +172,18 @@ function uninstall() {
 }
 
 async function status() {
-  const { loaded, pid } = agentState();
   const cfg = readConfig();
+  if (IS_WIN) {
+    const registered = winTaskRegistered();
+    const pid = daemonPid();
+    console.log(`任务计划:    ${registered ? `已注册${pid ? `（daemon pid ${pid}）` : ""}` : "未注册"}`);
+    console.log(`takeover:    ${cfg.takeover ? "开启" : "关闭"}（无端口启动时自动带端口重启）`);
+    console.log(`千问办公:    ${appRunning() ? "运行中" : "未运行"}`);
+    console.log(`CDP :${CDP_PORT}:    ${(await cdpUp()) ? "已就绪（注入生效）" : "未就绪"}`);
+    return;
+  }
+  if (!IS_MAC) { console.error(`✗ 不支持当前平台: ${process.platform}`); process.exit(1); }
+  const { loaded, pid } = agentState();
   console.log(`LaunchAgent: ${loaded ? `运行中 (pid ${pid ?? "?"})` : "未加载"}`);
   console.log(`takeover:    ${cfg.takeover ? "开启" : "关闭"}（无端口启动时自动带端口重启）`);
   console.log(`千问办公:    ${appRunning() ? "运行中" : "未运行"}`);
@@ -111,23 +194,33 @@ function setTakeover(on) {
   const cfg = readConfig();
   cfg.takeover = on;
   writeConfig(cfg);
+  if (IS_WIN) {
+    // 杀掉当前 daemon（锁文件里有 PID），任务计划下一分钟/手动立即拉起使配置生效
+    const pid = daemonPid();
+    if (pid) { try { execFileSync("taskkill", ["/F", "/PID", String(pid)], { stdio: "ignore" }); } catch {} }
+    try { execFileSync("schtasks", ["/Run", "/TN", WIN_TASK], { stdio: "ignore" }); } catch {}
+    console.log(`✓ takeover 已${on ? "开启" : "关闭"}（守护进程已重启）`);
+    return;
+  }
+  if (!IS_MAC) { console.error(`✗ 不支持当前平台: ${process.platform}`); process.exit(1); }
   sh("launchctl", ["kickstart", "-k", `gui/${UID}/${LABEL}`], { okFail: true }); // 重启 daemon 使配置生效
   console.log(`✓ takeover 已${on ? "开启" : "关闭"}（守护进程已重启）`);
 }
 
 function usage() {
-  console.log(`qw-edit — 千问办公「编辑已发消息」增强
+  console.log(`qw-edit v${VERSION} — 千问办公「编辑已发消息」增强
 
 用法:
-  qw-edit install    安装并启动（launchd 常驻）
+  qw-edit install    安装并启动（macOS: launchd；Windows: 任务计划）
   qw-edit uninstall  卸载
   qw-edit status     查看状态
   qw-edit enable     开启 takeover（默认）
   qw-edit disable    关闭 takeover
+  qw-edit --version  打印版本号
   qw-edit --help     显示本帮助
 
 说明:
-  安装目录 ~/.qw-edit    日志 ~/.qw-edit/daemon.log    调试端口 127.0.0.1:9222`);
+  支持 macOS 与 Windows。安装目录 ~/.qw-edit    日志 ~/.qw-edit/daemon.log    调试端口 127.0.0.1:9222`);
 }
 
 const cmd = process.argv[2];
@@ -137,6 +230,7 @@ switch (cmd) {
   case "status": await status(); break;
   case "enable": setTakeover(true); break;
   case "disable": setTakeover(false); break;
+  case "--version": case "-v": console.log(`qw-edit v${VERSION}`); break;
   // 约定：无参数与 --help/-h/help 都算"打印用法"，退出码 0；未知子命令才是错误（退出码 1）
   case undefined: case "--help": case "-h": case "help": usage(); break;
   default:

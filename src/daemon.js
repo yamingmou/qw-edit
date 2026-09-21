@@ -4,26 +4,32 @@
  *
  * 设计原则：注入脚本之外零动作，不直接读写客户端任何数据。
  *
- * 生命周期（配合 launchd KeepAlive + ThrottleInterval）：
- *  - 客户端未运行 → 立即退出（launchd 每 10s 拉起做一次毫秒级检查，机器上无常驻进程）
+ * 生命周期（配合平台调度）：
+ *  - macOS：launchd KeepAlive + ThrottleInterval，每 10s 拉起做毫秒级检查
+ *  - Windows：任务计划程序每分钟拉起一次（daemon-run.vbs 隐藏窗口）
+ *  - 客户端未运行 → 立即退出（等下一轮拉起，机器上无常驻进程）
  *  - 客户端运行且带调试端口 → 常驻，注入并保持
  *  - 客户端运行但无端口 → 弹询问框，用户同意才带端口重启（拒绝则本次运行不再问）
- *  - 客户端退出（CDP 消失）→ 退出，等 launchd 下轮拉起
+ *  - 客户端退出（CDP 消失）→ 退出，等下一轮拉起
  */
 import { readFile, readdir, stat as statFile } from "node:fs/promises";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, appendFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 const CDP_PORT = 9222;
 const POLL_MS = 3000;
 const EXIT_GRACE_MS = 15000; // CDP 消失后宽限，防 app 重启间隙误退出
-const APP_NAME = "QwenWorkCN"; // macOS 应用进程名（pgrep -x 精确匹配）
+const APP_NAME = "QwenWorkCN"; // macOS 应用进程名（pgrep -x 精确匹配）；Windows 上为 QwenWorkCN.exe
 const MARKER = path.join(tmpdir(), "qw-edit-relaunch.marker");
 const CONFIG_PATH = path.join(homedir(), ".qw-edit", "config.json");
 const INJECT_PATH = new URL("./inject.js", import.meta.url);
 const LOCK_PATH = path.join(homedir(), ".qw-edit", "daemon.lock");
+const LOG_PATH = path.join(homedir(), ".qw-edit", "daemon.log");
+
+const IS_MAC = process.platform === "darwin";
+const IS_WIN = process.platform === "win32";
 
 const config = { takeover: true, maxFailedTakeovers: 3 };
 try { Object.assign(config, JSON.parse(readFileSync(CONFIG_PATH, "utf8"))); } catch {}
@@ -31,16 +37,49 @@ try { Object.assign(config, JSON.parse(readFileSync(CONFIG_PATH, "utf8"))); } ca
 const injected = new Set(); // 已废弃，保留兼容
 let lastRelaunchAt = 0;
 let failedTakeovers = 0;
+let asking = false; // 弹框进行中标志：防并发弹框 / 防重入
 if (existsSync(MARKER)) { try { lastRelaunchAt = Number(readFileSync(MARKER, "utf8")) || 0; } catch {} }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (...a) => console.log(`[daemon ${new Date().toISOString().slice(11, 19)}]`, ...a);
+/* 日志：同时写控制台与 ~/.qw-edit/daemon.log（Windows 无 launchd 重定向，靠它留痕） */
+function fileLog(s) {
+  try { mkdirSync(path.dirname(LOG_PATH), { recursive: true }); appendFileSync(LOG_PATH, s + "\n"); } catch {}
+}
+const log = (...a) => {
+  const s = `[daemon ${new Date().toISOString().slice(11, 19)}] ${a.map(String).join(" ")}`;
+  console.log(s);
+  fileLog(s);
+};
+const dbg = (...a) => { if (process.env.QW_EDIT_DEBUG === "1") console.log("[dbg]", ...a); };
 
-/* ---------- 进程探测 ---------- */
+/* ---------- 进程探测（跨平台） ---------- */
 function appPids() {
   try {
+    if (IS_WIN) {
+      const out = execFileSync("tasklist", ["/FI", `IMAGENAME eq ${APP_NAME}.exe`, "/FO", "CSV", "/NH"], { encoding: "utf8" });
+      const pids = [];
+      for (const line of out.split("\n")) {
+        const m = new RegExp(`"${APP_NAME}\\.exe","(\\d+)"`).exec(line);
+        if (m) pids.push(m[1]);
+      }
+      return pids;
+    }
     return execFileSync("pgrep", ["-x", APP_NAME]).toString().split("\n").filter(Boolean);
   } catch { return []; }
+}
+/* Windows：一次 PowerShell 批量取所有进程已运行秒数（避免逐进程启动 PS 的开销） */
+function appUptimes(pids) {
+  if (!pids.length) return [];
+  if (IS_WIN) {
+    try {
+      const out = execFileSync("powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command",
+          `$ids = @(${pids.join(",")}); foreach ($p in (Get-Process -Id $ids -ErrorAction SilentlyContinue)) { [int]((Get-Date) - $p.StartTime).TotalSeconds }`],
+        { encoding: "utf8", timeout: 5000 });
+      return (out || "").trim().split(/\r?\n/).map(Number).filter((x) => Number.isFinite(x) && x >= 0);
+    } catch { return pids.map(() => 0); }
+  }
+  return pids.map(appUptime);
 }
 function appUptime(pid) {
   // macOS BSD ps：etime 格式为 [[dd-]hh:]mm:ss
@@ -51,6 +90,15 @@ function appUptime(pid) {
     const [d = 0, h = 0, m = 0, sec = 0] = parts.length === 4 ? parts : [0, ...parts];
     return d * 86400 + h * 3600 + m * 60 + sec;
   } catch { return 0; }
+}
+/* Windows：从运行中的主进程解析可执行文件路径（kill 后拿不到，必须 kill 前取） */
+function winAppExePath(pid) {
+  try {
+    const out = execFileSync("powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).Path`],
+      { encoding: "utf8", timeout: 5000 });
+    return (out || "").trim() || null;
+  } catch { return null; }
 }
 async function cdpUp() {
   try {
@@ -77,7 +125,7 @@ function atomicWrite(file, data) {
 }
 const askedFileWrite = () => { try { atomicWrite(ASKED_PATH, JSON.stringify(askedRuns)); } catch {} };
 
-/* 单实例锁：防止 launchd 拉起第二个 daemon 叠加弹框；持有 osascript 引用，
+/* 单实例锁：防止调度器拉起第二个 daemon 叠加弹框；持有弹框子进程引用，
  * daemon 退出时清理孤儿弹框 */
 const acquireLock = () => {
   try {
@@ -106,6 +154,28 @@ process.on("SIGINT", () => { killOrphanDialog(); releaseLock(); process.exit(0);
 function runKey(pids) { return pids.slice().sort().join(","); }
 
 function askRestartDialog() {
+  if (IS_WIN) {
+    // Windows：WScript.Shell.Popup 原生支持超时；返回 6=是(立即重启) 7=否(暂不) -1=超时
+    return new Promise((resolve) => {
+      let done = false;
+      // JS 里的 \n 会被 PowerShell 单引号字符串原样保留为真实换行；用反引号转义在单引号串里不生效
+      const text = "「编辑撤回 / 重新生成」尚未加载到千问办公。\n\n需要重启千问办公来加载（正在运行的任务会被中断）。\n选「否」则本次运行不再询问。";
+      const ps = `$w = New-Object -ComObject WScript.Shell; $r = $w.Popup('${text}', 60, 'qw-edit 加载器', 4 + 32); Write-Output $r`;
+      const enc = Buffer.from(ps, "utf16le").toString("base64");
+      const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", enc]);
+      currentAskChild = child;
+      let out = "";
+      const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 90_000);
+      const finish = (v) => { if (done) return; done = true; clearTimeout(timer); if (currentAskChild === child) currentAskChild = null; resolve(v); };
+      child.stdout?.on("data", (d) => { out += d; });
+      child.on("close", (code) => {
+        const n = Number((out || "").trim());
+        finish(code === 0 && n === 6);
+        if (!done) return;
+      });
+      child.on("error", (e) => { log("ask dialog 启动失败:", e.message); finish(false); });
+    });
+  }
   // 非阻塞 spawn：弹框期间轮询不能停摆；90s 兜底超时防 osascript 意外挂起
   return new Promise((resolve) => {
     let done = false;
@@ -129,20 +199,22 @@ function askRestartDialog() {
 }
 
 async function maybeAskTakeover() {
-  if (!config.takeover || failedTakeovers >= (config.maxFailedTakeovers ?? 3)) return;
+  if (!config.takeover || failedTakeovers >= (config.maxFailedTakeovers ?? 3)) return dbg("bail: takeover off / failed>=3", failedTakeovers);
   let pids = appPids();
-  if (!pids.length || (await cdpUp())) return;
-  const uptime = Math.min(...pids.map(appUptime));
-  if (uptime < 4) return;                             // 刚启动，稍等
-  if (Date.now() - lastRelaunchAt < 30_000) return;   // 防风暴
+  if (!pids.length) return dbg("bail: no pids");
+  if (await cdpUp()) return dbg("bail: cdpUp TRUE");
+  const uptimes = appUptimes(pids);
+  const uptime = uptimes.length ? Math.min(...uptimes) : 0;
+  if (uptime < 4) return dbg("bail: uptime<4", uptime);
+  if (Date.now() - lastRelaunchAt < 30_000) return dbg("bail: 30s cooldown", Date.now() - lastRelaunchAt);
   const key = runKey(pids);
   // asked.json 清理：超过 30 天的记录过期（防无限增长）
   const nowTs = Date.now();
   for (const k of Object.keys(askedRuns)) {
     if (nowTs - askedRuns[k] > 30 * 24 * 3600 * 1000) delete askedRuns[k];
   }
-  if (askedRuns[key]) return;                         // 本次运行已问过/已拒绝，尊重用户
-  if (asking) return;
+  if (askedRuns[key]) return dbg("bail: already asked", key.slice(0, 30));
+  if (asking) return dbg("bail: asking in flight");
   asking = true;
   try {
     log(`客户端已运行 ${uptime}s 但无 CDP 端口，询问用户是否重启加载…`);
@@ -154,11 +226,23 @@ async function maybeAskTakeover() {
     if (!pids.length) { log("用户同意时客户端已退出，跳过"); return; }
     if (await cdpUp()) { log("用户同意时客户端已带端口，无需重启"); return; }
     log("用户同意重启，结束无端口实例并带端口重开…");
-    for (const pid of pids) { try { process.kill(Number(pid), "SIGKILL"); } catch {} }
+    // Windows：kill 前先解析主进程 exe 路径（kill 后拿不到）
+    let exePath = null;
+    if (IS_WIN) {
+      for (const pid of pids) { exePath = winAppExePath(Number(pid)); if (exePath) break; }
+    }
+    killApp(pids);
     for (let i = 0; i < 20 && appPids().length; i++) await sleep(500);
-    await sleep(1000); // 给 LaunchServices 一点收尾时间
-    try { execFileSync("open", ["-a", APP_NAME, "--args", `--remote-debugging-port=${CDP_PORT}`]); }
-    catch (e) { log("relaunch failed:", e.message); return; }
+    await sleep(1000); // 给系统一点收尾时间
+    try {
+      if (IS_WIN) {
+        if (!exePath) throw new Error("无法解析客户端可执行文件路径");
+        const child = spawn(exePath, [`--remote-debugging-port=${CDP_PORT}`], { detached: true, stdio: "ignore" });
+        child.unref();
+      } else {
+        execFileSync("open", ["-a", APP_NAME, "--args", `--remote-debugging-port=${CDP_PORT}`]);
+      }
+    } catch (e) { log("relaunch failed:", e.message); return; }
     lastRelaunchAt = Date.now();
     try { atomicWrite(MARKER, String(lastRelaunchAt)); } catch {}
     setTimeout(async () => {
@@ -166,6 +250,16 @@ async function maybeAskTakeover() {
       else { failedTakeovers++; log(`takeover 后 CDP 未就绪（第 ${failedTakeovers} 次失败）`); }
     }, 60_000);
   } finally { asking = false; }
+}
+/* 结束客户端进程组：Windows 用 taskkill /T（含子进程），macOS 直接 SIGKILL */
+function killApp(pids) {
+  if (IS_WIN) {
+    for (const pid of pids) {
+      try { execFileSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore" }); } catch {}
+    }
+    return;
+  }
+  for (const pid of pids) { try { process.kill(Number(pid), "SIGKILL"); } catch {} }
 }
 
 /* ---------- CDP 注入 ---------- */
@@ -255,13 +349,28 @@ async function injectIntoTarget(t) {
  * inject.js 通过 window.__qwEditTakePendingOp / __qwEditResolveOp
  * 与 daemon 通信（经 CDP 轮询，无 HTTP 端口、无 CSP 问题）。
  * 原则：绝不修改/删除任何既有文件；shadow 操作只新增一个截断视图文件。 */
-const SESSION_ROOTS = [
-  path.join(homedir(), ".qwenworkcn", "projects"),
-  path.join(homedir(), ".qoderwork", "projects"),
-];
+/* 跨平台会话转录根目录候选：
+ * macOS: ~/.qwenworkcn/projects、~/.qoderwork/projects
+ * Windows: %APPDATA%/QwenWorkCN/{data/,}projects、%LOCALAPPDATA%/QwenWorkCN/{data/,}projects 等
+ * 可用 config.json 的 sessionRoots 显式覆盖（数组，优先） */
+function sessionRoots() {
+  const cfg = Array.isArray(config.sessionRoots) ? config.sessionRoots : [];
+  const defaults = IS_WIN ? [
+    path.join(process.env.APPDATA || homedir(), "QwenWorkCN", "data", "projects"),
+    path.join(process.env.APPDATA || homedir(), "QwenWorkCN", "projects"),
+    path.join(process.env.LOCALAPPDATA || homedir(), "QwenWorkCN", "data", "projects"),
+    path.join(process.env.LOCALAPPDATA || homedir(), "QwenWorkCN", "projects"),
+    path.join(homedir(), ".qwenworkcn", "projects"),
+    path.join(homedir(), ".qoderwork", "projects"),
+  ] : [
+    path.join(homedir(), ".qwenworkcn", "projects"),
+    path.join(homedir(), ".qoderwork", "projects"),
+  ];
+  return [...new Set([...cfg, ...defaults])];
+}
 async function findSessionFile(sessionId) {
   if (!/^[\w-]+$/.test(sessionId)) return null; // 防路径注入
-  for (const root of SESSION_ROOTS) {
+  for (const root of sessionRoots()) {
     let dirs;
     try { dirs = await readdir(root); } catch { continue; }
     for (const d of dirs) {
@@ -271,10 +380,12 @@ async function findSessionFile(sessionId) {
   }
   return null;
 }
-/* 与客户端 normalizeForkPointText 相同的规范化（工作区路径脱敏 + 空白归一） */
+/* 与客户端 normalizeForkPointText 相同的规范化（工作区路径脱敏 + 空白归一）。
+ * 同时处理 POSIX（macOS）与 Windows 盘符路径两种形态。 */
 function normForkText(s) {
   return (s || "")
     .replace(/(?:file:\/\/)?\/[^\s)\]]*\/(?:\.qoderwork|\.qwenworkcn(?:dev)?)\/workspace\/[^\s)\]]+/g, "<workspace-file>")
+    .replace(/(?:[A-Za-z]:[\\/])?[^\s)\]]*[\\/](?:\.qoderwork|\.qwenworkcn(?:dev)?)[\\/]workspace[\\/][^\s)\]]+/gi, "<workspace-file>")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -361,12 +472,13 @@ async function pollOps() {
 
 /* ---------- 主循环：生命周期跟随客户端 ---------- */
 async function main() {
+  try { mkdirSync(path.join(homedir(), ".qw-edit"), { recursive: true }); } catch {}
   // 单实例锁：已有一个活着的 daemon 时本实例立即退出（防叠框、防重复接管）
   if (!acquireLock()) { log("已有 daemon 实例在运行，本实例退出"); process.exit(0); }
-  log(`qw-edit daemon started (takeover=${config.takeover})`);
-  // 初始检查：客户端没跑就立即退出（launchd 节流拉起，常态零占用）
+  log(`qw-edit daemon started (takeover=${config.takeover}, platform=${process.platform})`);
+  // 初始检查：客户端没跑就立即退出（调度器节流拉起，常态零占用）
   if (!appPids().length && !(await cdpUp())) {
-    log("app 未运行，退出（等 launchd 下轮检查）");
+    log("app 未运行，退出（等调度器下轮检查）");
     process.exit(0);
   }
   let cdpDownSince = 0;
@@ -374,6 +486,8 @@ async function main() {
   setInterval(async () => {
     try {
       const up = await cdpUp();
+      const pidsNow = appPids();
+      dbg("tick up=", up, "pids=", pidsNow.length, pidsNow.join(",") || "(空)");
       if (up) {
         cdpDownSince = 0;
         for (const t of await listTargets()) {
@@ -382,7 +496,7 @@ async function main() {
         }
       } else {
         // CDP 没起来：要么 app 没跑，要么需要询问重启，要么正处重启间隙
-        if (appPids().length) {
+        if (pidsNow.length) {
           await maybeAskTakeover();
           cdpDownSince = 0; // app 还在，继续守
         } else if (cdpDownSince === 0) {
@@ -392,7 +506,7 @@ async function main() {
           process.exit(0);
         }
       }
-    } catch { /* 静默重试 */ }
+    } catch (e) { log("loop error:", e?.stack?.split("\n").slice(0, 3).join(" | ") || String(e)); }
   }, POLL_MS);
 }
 main();
