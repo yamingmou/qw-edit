@@ -14,7 +14,7 @@
  */
 import { readFile, readdir, stat as statFile } from "node:fs/promises";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, appendFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, appendFileSync, openSync, writeSync, closeSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
@@ -127,18 +127,36 @@ const askedFileWrite = () => { try { atomicWrite(ASKED_PATH, JSON.stringify(aske
 
 /* 单实例锁：防止调度器拉起第二个 daemon 叠加弹框；持有弹框子进程引用，
  * daemon 退出时清理孤儿弹框 */
+/* 原子获取锁：O_CREAT|O_EXCL 排他创建（读-检查-写非原子会双实例竞态，
+ * 曾导致两个 daemon 同毫秒起、日志双发）。陈旧锁（pid 已死）→ 删除重试。 */
 const acquireLock = () => {
-  try {
-    if (existsSync(LOCK_PATH)) {
-      const pid = Number(readFileSync(LOCK_PATH, "utf8"));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let fd = -1;
+    try {
+      fd = openSync(LOCK_PATH, "wx");
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
+      return true;
+    } catch (e) {
+      if (fd >= 0) { try { closeSync(fd); } catch {} }
+      if (e.code === "ENOENT") { try { mkdirSync(path.dirname(LOCK_PATH), { recursive: true }); } catch {} continue; }
+      if (e.code !== "EEXIST") return false;
+      let pid = 0;
+      try { pid = Number(readFileSync(LOCK_PATH, "utf8")); } catch {}
+      let holderAlive = false;
       if (pid && pid !== process.pid) {
-        try { process.kill(pid, 0); return false; }      // 存活实例持有锁
-        catch (e) { if (e.code !== "ESRCH") return false; } // EPERM 也视为存活
+        try { process.kill(pid, 0); holderAlive = true; }
+        catch (er) { if (er.code !== "ESRCH") holderAlive = true; } // EPERM 视为存活
       }
+      if (holderAlive) return false;
+      // 陈旧锁：rename 原子认领（成功者删认领副本；败者 ENOENT 退出重试）。
+      // 直接 unlink 有窗口会删掉另一实例刚创建的新锁。
+      const claimed = LOCK_PATH + ".stale." + process.pid;
+      try { renameSync(LOCK_PATH, claimed); } catch { continue; }
+      try { unlinkSync(claimed); } catch {}
     }
-    atomicWrite(LOCK_PATH, String(process.pid));
-    return true;
-  } catch { return false; }
+  }
+  return false;
 };
 const releaseLock = () => {
   try {
@@ -191,6 +209,7 @@ function askRestartDialog() {
     child.stdout?.on("data", (d) => { out += d; });
     child.stderr?.on("data", (d) => { err += d; });
     child.on("close", (code) => {
+      if (code !== 0 || !out.trim()) log(`ask dialog 退出 code=${code} stdout=${JSON.stringify(out.trim().slice(0, 80))} stderr=${JSON.stringify(err.trim().slice(0, 150))}`);
       finish(code === 0 && out.includes("立即重启"));
       if (!done) return;
     });

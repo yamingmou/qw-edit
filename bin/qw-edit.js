@@ -140,9 +140,16 @@ function install() {
   mkdirSync(path.dirname(PLIST), { recursive: true });
   writeFileSync(PLIST, plist);
 
-  // （重）加载 agent
+  // （重）加载 agent。注意竞态：bootout 返回后 launchd 可能尚未拆完服务，
+  // 立即 bootstrap 会以状态 5 失败——退避重试。
   sh("launchctl", ["bootout", `gui/${UID}/${LABEL}`], { okFail: true });
-  sh("launchctl", ["bootstrap", `gui/${UID}`, PLIST]);
+  const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  let bootOk = false;
+  for (let i = 0; i < 6 && !bootOk; i++) {
+    try { sh("launchctl", ["bootstrap", `gui/${UID}`, PLIST]); bootOk = true; }
+    catch { sleepSync(400); }
+  }
+  if (!bootOk) { console.error("✗ launchd 加载失败（bootstrap 多次失败）。可稍后重试或手动执行：\n  launchctl bootstrap gui/" + UID + " " + PLIST); process.exit(1); }
   sh("launchctl", ["kickstart", `gui/${UID}/${LABEL}`], { okFail: true });
 
   console.log("✓ qw-edit 已安装并启动");

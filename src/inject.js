@@ -501,6 +501,37 @@
       ta.focus(); ta.select();
     });
   }
+  const style2 = document.createElement("style");
+  style2.textContent = `
+    .qw-del-btn{position:absolute;right:26px;top:50%;transform:translateY(-50%);z-index:9998;border:none;background:transparent;
+      cursor:pointer;font-size:13px;line-height:1;padding:3px;border-radius:5px;opacity:0;transition:opacity .15s}
+    .qw-chat-row:hover>.qw-del-btn{opacity:.75}
+    .qw-del-btn:hover{opacity:1 !important;background:rgba(239,68,68,.15)}
+    .qw-trash-entry{position:fixed;top:10px;left:118px;z-index:99997;display:inline-flex;align-items:center;gap:4px;
+      padding:4px 10px;border-radius:999px;border:1px solid rgba(128,128,128,.35);
+      background:var(--color-bg-base,rgba(255,255,255,.9));color:var(--text-base-primary,inherit);cursor:pointer;font-size:12px;
+      -webkit-app-region:no-drag;box-shadow:0 1px 4px rgba(0,0,0,.12)}
+    .qw-trash-entry:hover{background:var(--overlay-on-container-hover,rgba(128,128,128,.12))}
+    .qw-admin-overlay{position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center}
+    .qw-admin{width:min(560px,92vw);max-height:min(640px,86vh);display:flex;flex-direction:column;background:var(--color-bg-base,#fff);
+      color:var(--text-base-primary,#222);border-radius:12px;box-shadow:0 12px 48px rgba(0,0,0,.35);overflow:hidden}
+    .qw-admin-title{font-weight:600;padding:14px 16px 8px;font-size:15px}
+    .qw-admin-body{overflow-y:auto;padding:0 16px;flex:1}
+    .qw-admin-sec{margin:8px 0 12px}
+    .qw-admin-sub{color:#999;font-weight:400;font-size:12px;margin-left:8px}
+    .qw-admin-list{border:1px solid rgba(128,128,128,.25);border-radius:8px;max-height:200px;overflow-y:auto;margin-top:6px}
+    .qw-admin-row{display:flex;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid rgba(128,128,128,.12);font-size:13px;cursor:pointer}
+    .qw-admin-row:last-child{border-bottom:none}
+    .qw-admin-row:hover{background:rgba(128,128,128,.08)}
+    .qw-admin-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .qw-admin-date{color:#999;font-size:11px}
+    .qw-admin-actions{display:flex;flex-wrap:wrap;gap:8px;padding:12px 16px;border-top:1px solid rgba(128,128,128,.2)}
+    .qw-admin-btn{padding:6px 10px;border-radius:7px;border:1px solid rgba(128,128,128,.35);background:transparent;color:inherit;cursor:pointer;font-size:12px}
+    .qw-admin-btn:hover{background:rgba(128,128,128,.1)}
+    .qw-admin-danger{border-color:rgba(239,68,68,.6);color:#e05252}
+    .qw-admin-danger:hover{background:rgba(239,68,68,.1)}
+  `;
+  document.head.appendChild(style2);
   const BTN_EDIT = "qw-edit-btn";
   const BTN_REGEN = "qw-regen-btn";
   const BTN_REGEN_END = "qw-regen-end-btn";
@@ -864,13 +895,307 @@
     }
   }
 
+  /* ---------- 10. 会话删除与回收站（A 侧边栏🗑 / B 回收站弹窗 / C 测试会话清理） ----------
+   * 软删 chats.delete 进回收站可恢复；彻底删除 chats.permanentDelete 双重确认。
+   * 安全：侧边栏 🗑 仅对名字唯一的会话挂载（同名歧义交给弹窗按 id 操作）；
+   * 删除当前打开的会话前先导航到其它会话。 */
+  let chatCache = { ts: 0, chats: [] };
+  async function refreshChatCache(force = false) {
+    if (!force && Date.now() - chatCache.ts < 5000) return chatCache.chats;
+    try {
+      let chats = await q("chats.listSidebar");
+      chats = Array.isArray(chats) ? chats : (chats?.json ?? chats?.chats ?? []);
+      chatCache = { ts: Date.now(), chats };
+    } catch { /* 保留旧缓存 */ }
+    return chatCache.chats;
+  }
+  function currentChatId() {
+    try { return new URLSearchParams(location.search).get("chat"); } catch { return null; }
+  }
+  async function navigateAwayFrom(chatId) {
+    const chats = await refreshChatCache(true);
+    for (const other of chats.filter((c) => c.id !== chatId).slice(0, 5)) {
+      const items = sidebarItemsByName(other.name || "");
+      if (items.length) {
+        items[0].click();
+        await sleep(800);
+        if (!location.search.includes(chatId)) return true;
+      }
+    }
+    return !location.search.includes(chatId);
+  }
+  /* 无名会话在侧边栏显示为占位标题「新任务」，与顶部按钮撞文本：
+   * 用位置规则识别（y>150 且非头部导航区）。仅当无名会话恰好一条时才认领该行。 */
+  const UNNAMED_LABEL = "新任务";
+  function unnamedRowOf() {
+    const side = document.querySelector('[class*="sidebar"]') || document.body;
+    const walker = document.createTreeWalker(side, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      if ((node.textContent || "").trim() !== UNNAMED_LABEL) continue;
+      const btn = node.parentElement?.closest("button");
+      if (!btn || !side.contains(btn)) continue;
+      const r = btn.getBoundingClientRect();
+      if (r.top < 150 || r.left > 320) continue;          // 排除顶部「新任务」按钮
+      const row = btn.parentElement || btn;
+      if (row.querySelector(":scope > .qw-del-btn")) continue;
+      return row;
+    }
+    return null;
+  }
+  function removeChatRow(ch) {
+    const n = (ch?.name || "").trim();
+    const row = n ? chatRowOf(n) : unnamedRowOf();
+    if (row) row.remove();
+  }
+  async function trashChat(ch, { skipConfirm = false } = {}) {
+    if (!ch?.id) return false;
+    // 删除前实时校验：名字若已不唯一（缓存期撞名），拒绝按缓存 id 侧边栏删除
+    {
+      const n = (ch.name || "").trim();
+      const fresh = await refreshChatCache(true);
+      if (n && fresh.filter((c) => (c.name || "").trim() === n).length > 1) {
+        toast(`「${n}」存在重名，出于安全请改用「回收站」弹窗勾选删除`, "warn");
+        return false;
+      }
+    }
+    if (!skipConfirm) {
+      const ok = await uiConfirm({
+        title: "删除会话",
+        body: `「${(ch.name || "").trim() || "未命名会话"}」将移入回收站（之后可在「回收站」里恢复或彻底删除）。继续？`,
+        confirmText: "移入回收站",
+      });
+      if (!ok) return false;
+    }
+    if (currentChatId() === ch.id && !(await navigateAwayFrom(ch.id))) {
+      toast("无法切换到其它会话（可能只剩这一个会话），已取消删除", "warn");
+      return false;
+    }
+    await m("chats.delete", { id: ch.id });
+    removeChatRow(ch);
+    toast(`会话「${ch.name || "未命名"}」已移入回收站`);
+    return true;
+  }
+  async function permanentDeleteChats(items, { skipConfirm = false } = {}) {
+    if (!items.length) return 0;
+    if (!skipConfirm) {
+      const names = items.slice(0, 5).map((c) => c.name || "未命名").join("、");
+      const more = items.length > 5 ? ` 等 ${items.length} 个` : ` ${items.length} 个`;
+      const ok1 = await uiConfirm({
+        title: "彻底删除",
+        body: `将永久删除${more}：${names}。\n不可恢复，关联工作区文件一并清理。`,
+        confirmText: "继续",
+      });
+      if (!ok1) return 0;
+      const ok2 = await uiConfirm({ title: "最后确认", body: "彻底删除后无法通过回收站找回。确认执行？", confirmText: "永久删除" });
+      if (!ok2) return 0;
+    }
+    let n = 0;
+    for (const c of items) {
+      try {
+        if (currentChatId() === c.id && !(await navigateAwayFrom(c.id))) {
+          toast(`「${c.name}」是当前会话且无法切走，已跳过`, "warn");
+          continue;
+        }
+        await m("chats.permanentDelete", { id: c.id });
+        removeChatRow(c);
+        n++;
+      } catch (e) { toast(`彻底删除「${c.name}」失败: ${e.message}`, "err"); }
+    }
+    if (n) toast(`已彻底删除 ${n} 个会话`);
+    return n;
+  }
+
+  /* A. 侧边栏悬停 🗑（仅名字唯一者）。条目结构有两种：项目分组是 li，"最近"分组是
+   * button 的直接行容器（div.group.relative）——统一用"文本节点→closest(button)→父行"识别，
+   * 且限定在 sidebar 子树内，避免误挂正文里恰好同名的文本。 */
+  function chatRowOf(name) {
+    const side = document.querySelector('[class*="sidebar"]') || document.body;
+    const walker = document.createTreeWalker(side, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      if ((node.textContent || "").trim() !== name) continue;
+      const btn = node.parentElement?.closest("button");
+      if (!btn) continue;
+      if (!side.contains(btn)) continue;
+      return btn.parentElement || btn;
+    }
+    return null;
+  }
+  async function mountSidebarDeleteButtons() {
+    const chats = await refreshChatCache();
+    const counts = {};
+    const byName = new Map();
+    for (const c of chats) {
+      const n = (c.name || "").trim();
+      if (!n) continue;
+      counts[n] = (counts[n] || 0) + 1;
+      byName.set(n, c);
+    }
+    const side = document.querySelector('[class*="sidebar"]') || document.body;
+    const walker = document.createTreeWalker(side, NodeFilter.SHOW_TEXT);
+    let node;
+    const seen = new Set();
+    while ((node = walker.nextNode())) {
+      const t = (node.textContent || "").trim();
+      if (!t || counts[t] !== 1) continue;
+      const btn = node.parentElement?.closest("button");
+      if (!btn) continue;
+      const row = btn.parentElement || btn;
+      if (!row || seen.has(row) || row.querySelector(":scope > .qw-del-btn")) continue;
+      seen.add(row);
+      row.classList.add("qw-chat-row");
+      if (getComputedStyle(row).position === "static") row.style.position = "relative";
+      const b = document.createElement("button");
+      b.className = "qw-del-btn";
+      b.textContent = "🗑";
+      b.title = "删除会话（移入回收站，可恢复）";
+      b.onclick = (ev) => { ev.stopPropagation(); void trashChat(byName.get(t)); };
+      row.appendChild(b);
+    }
+    // 无名会话（侧边栏占位「新任务」）：仅一条时挂载，多条无法区分交给弹窗
+    const unnamed = chats.filter((c) => !(c.name || "").trim());
+    if (unnamed.length === 1) {
+      const row = unnamedRowOf();
+      if (row) {
+        row.classList.add("qw-chat-row");
+        if (getComputedStyle(row).position === "static") row.style.position = "relative";
+        const b = document.createElement("button");
+        b.className = "qw-del-btn";
+        b.textContent = "🗑";
+        b.title = "删除会话（未命名，移入回收站可恢复）";
+        b.onclick = (ev) => { ev.stopPropagation(); void trashChat(unnamed[0]); };
+        row.appendChild(b);
+      }
+    }
+  }
+
+  /* B+C. 回收站 / 清理 管理弹窗 */
+  const TEST_PATTERNS = [/^测试/, /^要求?只回复/, /^要求回复/, /^回复好的/, /^只回复/, /^回复指定内容/, /^qw-e2e-/, /^好的$/, /^要求回复苹果/, /^不删不改/, /^回退的是/, /^重发走/, /^安全护栏/, /^遮蔽转录/, /^截断投影/, /^重指会话/, /^投影的/, /^客户端 resume/, /^失败路径/, /^编辑重发：/];
+  function looksLikeTest(name) { return TEST_PATTERNS.some((re) => re.test((name || "").trim())); }
+  async function openAdminModal() {
+    if (document.querySelector(".qw-admin-overlay")) return;
+    const ov = document.createElement("div");
+    ov.className = "qw-admin-overlay";
+    ov.innerHTML = `
+      <div class="qw-admin" role="dialog" aria-modal="true" aria-label="qw-edit 会话管理">
+        <div class="qw-admin-title">会话管理 · 回收站</div>
+        <div class="qw-admin-body">
+          <div class="qw-admin-sec"><b>当前会话</b><span class="qw-admin-sub">勾选后可移入回收站 / 彻底删除</span><div class="qw-admin-list" data-list="active"></div></div>
+          <div class="qw-admin-sec"><b>回收站</b><span class="qw-admin-sub">已删除，可恢复或彻底删除</span><div class="qw-admin-list" data-list="trash"></div></div>
+        </div>
+        <div class="qw-admin-actions">
+          <button data-act="pick-test" class="qw-admin-btn">勾选疑似测试会话</button>
+          <button data-act="trash-sel" class="qw-admin-btn">移入回收站(所选)</button>
+          <button data-act="restore-sel" class="qw-admin-btn">恢复(所选)</button>
+          <button data-act="purge-sel" class="qw-admin-btn qw-admin-danger">彻底删除(所选)</button>
+          <button data-act="close" class="qw-admin-btn">关闭</button>
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+    let adminBusy = false;
+    const runExclusive = async (fn) => {
+      if (adminBusy) return;
+      adminBusy = true;
+      const btns = [...ov.querySelectorAll(".qw-admin-btn")];
+      btns.forEach((b) => { b.disabled = true; });
+      try { await fn(); }
+      catch (e) { toast("操作失败: " + e.message, "err"); }
+      finally { btns.forEach((b) => { b.disabled = false; }); adminBusy = false; }
+    };
+    const listBox = (key) => ov.querySelector(`[data-list="${key}"]`);
+    const row = (c, kind) => {
+      const r = document.createElement("label");
+      r.className = "qw-admin-row";
+      const when = kind === "trash" && c.deletedAt ? ` <span class="qw-admin-date">${new Date(c.deletedAt).toLocaleDateString()}</span>` : "";
+      r.innerHTML = `<input type="checkbox" data-kind="${kind}" value="${escHtml(c.id)}"><span class="qw-admin-name">${escHtml(c.name || "未命名会话")}</span>${when}`;
+      return r;
+    };
+    const reload = async () => {
+      const act = await refreshChatCache(true);
+      const boxA = listBox("active"); boxA.innerHTML = "";
+      for (const c of act) boxA.appendChild(row(c, "active"));
+      try {
+        let d = await q("chats.listDeleted", {});
+        d = d?.json ?? d;
+        const trash = Array.isArray(d) ? d : (d?.chats ?? d?.items ?? []);
+        const boxT = listBox("trash"); boxT.innerHTML = "";
+        for (const c of trash) boxT.appendChild(row(c, "trash"));
+      } catch (e) { const boxT = listBox("trash"); boxT.textContent = "回收站读取失败: " + e.message; }
+    };
+    const checkedOf = (kind) => [...ov.querySelectorAll(`input[data-kind="${kind}"]:checked`)].map((i) => i.value);
+    ov.querySelector('[data-act="close"]').onclick = () => ov.remove();
+    ov.addEventListener("mousedown", (e) => { if (e.target === ov) ov.remove(); });
+    ov.querySelector('[data-act="pick-test"]').onclick = () => {
+      for (const i of ov.querySelectorAll('input[data-kind="active"]')) {
+        const name = i.parentElement.querySelector(".qw-admin-name").textContent;
+        if (looksLikeTest(name)) i.checked = true;
+      }
+    };
+    ov.querySelector('[data-act="trash-sel"]').onclick = () => void runExclusive(async () => {
+      const ids = new Set(checkedOf("active"));
+      if (!ids.size) { toast("未勾选当前会话", "warn"); return; }
+      const chats = await refreshChatCache(true);
+      const items = chats.filter((c) => ids.has(c.id));
+      const names = items.slice(0, 6).map((c) => c.name || "未命名").join("、");
+      const ok = await uiConfirm({
+        title: "移入回收站",
+        body: `将把 ${items.length} 个会话移入回收站（可恢复）：${names}${items.length > 6 ? " 等" : ""}。继续？`,
+        confirmText: "移入回收站", danger: false,
+      });
+      if (!ok) return;
+      let n = 0;
+      for (const c of items) {
+        try { if (await trashChat(c, { skipConfirm: true })) n++; } catch (e) { toast(`删除「${c.name}」失败: ${e.message}`, "err"); }
+      }
+      toast(`已移入回收站 ${n}/${items.length} 个`);
+      await reload();
+    });
+    ov.querySelector('[data-act="restore-sel"]').onclick = () => void runExclusive(async () => {
+      const ids = checkedOf("trash");
+      if (!ids.length) { toast("未勾选回收站项", "warn"); return; }
+      let ok = 0;
+      for (const id of ids) { try { await m("chats.restoreDeleted", { id }); ok++; } catch (e) { toast("恢复失败: " + e.message, "err"); } }
+      toast(ok === ids.length ? `已恢复 ${ok} 个会话` : `恢复 ${ok}/${ids.length} 成功，其余失败`);
+      await reload();
+    });
+    ov.querySelector('[data-act="purge-sel"]').onclick = () => void runExclusive(async () => {
+      const aIds = new Set(checkedOf("active")), tIds = new Set(checkedOf("trash"));
+      if (!aIds.size && !tIds.size) return toast("未勾选项", "warn");
+      const items = [];
+      if (aIds.size) for (const c of await refreshChatCache(true)) if (aIds.has(c.id)) items.push(c);
+      if (tIds.size) {
+        let d = await q("chats.listDeleted", {}); d = d?.json ?? d;
+        const trash = Array.isArray(d) ? d : (d?.chats ?? []);
+        for (const c of trash) if (tIds.has(c.id)) items.push(c);
+      }
+      await permanentDeleteChats(items);
+      await reload();
+    });
+    await reload();
+  }
+  /* 入口：fixed 悬浮在顶部标题栏（logo 右侧空位）。标题栏是拖拽区，须声明 no-drag */
+  function mountTrashEntry() {
+    let b = document.querySelector(".qw-trash-entry");
+    if (!b) {
+      b = document.createElement("button");
+      b.className = "qw-trash-entry";
+      b.textContent = "🗑 回收站";
+      b.title = "会话管理：删除 / 回收站 / 彻底删除";
+      b.onclick = (ev) => { ev.stopPropagation(); void openAdminModal(); };
+      document.body.appendChild(b);
+    }
+    if (b.parentElement !== document.body) document.body.appendChild(b); // 纠正旧版侧边栏位置
+  }
+
   /* ---------- 9. 调试入口 & 启动 ---------- */
   window.__qwEdit = {
     trpc, findMessages, loadMessages, chatDetail, fillComposer,
     trueRollback, ensureIdle, subChatState, pinHits, daemonOp, toast,
     uiConfirm, uiPrompt, sendViaComposer,
     firstTurnReinit, rebindView, sidebarItemsByName,
+    trashChat, permanentDeleteChats, openAdminModal, refreshChatCache, looksLikeTest,
   };
-  setInterval(() => { mountButtons(); void mountTimes(); }, 1500);
-  log("v9.12 loaded (edit/regen + times + composer-send + prompt/time-anchored shadow). 调试入口: window.__qwEdit");
+  setInterval(() => { mountButtons(); void mountTimes(); void mountSidebarDeleteButtons(); mountTrashEntry(); }, 1500);
+  log("v9.17 loaded (unnamed chat row support) (edit/regen + times + composer-send + prompt/time-anchored shadow). 调试入口: window.__qwEdit");
 })();
