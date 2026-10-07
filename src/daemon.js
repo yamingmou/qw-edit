@@ -563,7 +563,26 @@ async function shadowTruncate({ sessionId, newSessionId, anchorOrdinal, anchorTe
     return { ok: false, error: `anchor-not-located (ordinal=${ordinal}, groups=${groups.length}${anchorText ? ", 锚点文本未唯一命中" : ""}${stopBeforeUserText ? ", 提问未在转录中定位到" : ""})` };
   }
   const idx = g.end;
-  const out = lines.slice(0, idx + 1).map((l) => l.split(sessionId).join(newSessionId));
+  // 1.2.5 实锤：UI 提交转录里有独立 <system-reminder> 用户行/混排提醒段，投影只存干净文本
+  // → resume 时客户端把"转录有投影无"的行回灌投影（=重新生成后冒幽灵重复消息）。
+  // 遮蔽时同步净化：剥提醒段；整行只剩提醒则丢弃，使转录与投影对齐。
+  let droppedRem = 0;
+  const out = lines.slice(0, idx + 1).flatMap((l) => {
+    let obj = null;
+    try { obj = JSON.parse(l); } catch {}
+    if (obj && obj.type === "user" && Array.isArray(obj.message && obj.message.content)) {
+      const parts = obj.message.content.map((pp) => {
+        if (!pp || pp.type !== "text" || typeof pp.text !== "string") return pp;
+        const t2 = pp.text.replace(/<system-reminder>[\s\S]*?(?:<\/system-reminder>|$)/g, " ").replace(/\s+/g, " ").trim();
+        return { ...pp, text: t2 };
+      });
+      const hasReal = parts.some((pp) => !pp || pp.type !== "text" || (pp.text || "").trim());
+      if (!hasReal) { droppedRem++; return []; }
+      obj = { ...obj, message: { ...obj.message, content: parts } };
+      return [JSON.stringify(obj).split(sessionId).join(newSessionId)];
+    }
+    return [l.split(sessionId).join(newSessionId)];
+  });
   const dest = path.join(path.dirname(srcFile), `${newSessionId}.jsonl`);
   try { await statFile(dest); return { ok: false, error: "dest-exists" }; } catch {}
   const { writeFile } = await import("node:fs/promises");
@@ -578,7 +597,7 @@ async function shadowTruncate({ sessionId, newSessionId, anchorOrdinal, anchorTe
   }
   const violations = findForbiddenViolations(out, forbidden, scopeFrom);
   if (violations.length) return { ok: false, error: "forbidden-text-present", violations };
-  return { ok: true, file: dest, lines: out.length, originalLines: lines.length };
+  return { ok: true, file: dest, lines: out.length, originalLines: lines.length, droppedReminders: droppedRem };
 }
 /* 每秒轮询各已连接页面：有待处理操作则执行并回填结果 */
 const OP_POLL_MS = 1000;

@@ -117,7 +117,18 @@
   }
 
   /* ---------- 4. 跨会话定位消息 + DOM 锚定（防误伤） ---------- */
-  async function chatDetail(chatId) {
+  /* 当前会话的权威识别：侧边栏激活行（data-chat-item + 内部 aria-current）→ data-chat-id；
+   * URL ?chat= 仅兜底（1.2.5 实锤：新任务原地首发后 URL 仍停留在旧会话）。 */
+  function currentChatId() {
+    for (const row of document.querySelectorAll("[data-chat-item][data-chat-id]")) {
+      if (row.querySelector("[aria-current], [data-state='active'], [data-active='true']")) {
+        const id = row.getAttribute("data-chat-id");
+        if (id) return id;
+      }
+    }
+    try { return new URLSearchParams(location.search).get("chat"); } catch { return null; }
+  }
+    async function chatDetail(chatId) {
     let det = await q("chats.get", { id: chatId });
     det = det?.json ?? det;
     const subs = det?.subChats ?? det?.chat?.subChats ?? [];
@@ -314,6 +325,7 @@
 
     // 3. 重指会话（下次提交 resume 遮蔽文件 → 模型失忆）
     await m("chats.updateSubChatSession", { id: subChatId, sessionId: newSessionId });
+    await dropRuntimeFor(subChatId); // 防旧 runtime 回放旧历史污染遮蔽会话
     log("session repointed ->", newSessionId);
     return { lines: r.lines, originalLines: r.originalLines, newSessionId };
   }
@@ -333,67 +345,82 @@
     log("subChat re-init:", sub.id, "->", newId);
     return newId;
   }
-  /* 视图刷新（无重载）：我们的 tRPC 提交对渲染层是"身外之事"（官方流程中乐观
-   * 更新与流订阅都由渲染层自己发起），提交后需让视图重新拉取。
-   * 做法：点击侧边栏中该会话条目 → React 重新挂载视图并 refetch。
-   * 绝不用 location.reload / openMainWindowWithChat（会整页重载，实测重载后
-   * 立即执行 tRPC 查询会让渲染进程假死）。找不到条目则提示手动切换。 */
+  /* 侧边栏条目通用识别：项目分组是 li，"最近"分组是 div 行（button 直接子级）——
+   * 统一为「侧边栏子树内 文本→closest(button)」。仅供删除流程（navigateAwayFrom）
+   * 使用；编辑/重新生成绝不点击其它会话（不变式）。 */
   function sidebarItemsByName(chatName) {
     if (!chatName) return [];
+    const side = document.querySelector('[class*="sidebar"]') || document.body;
     const out = [];
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const walker = document.createTreeWalker(side, NodeFilter.SHOW_TEXT);
     let node;
     while ((node = walker.nextNode())) {
       const t = (node.textContent || "").trim();
       if (!t || !(t === chatName || t.includes(chatName))) continue;
-      const btn = node.parentElement?.closest("li")?.querySelector("button");
-      if (btn && !out.includes(btn)) out.push(btn);
+      const btn = node.parentElement?.closest("button");
+      if (btn && side.contains(btn) && !out.includes(btn)) out.push(btn);
     }
     return out;
   }
-  function sidebarFirstOtherItem(chatName) {
-    const items = [...document.querySelectorAll("li button")];
-    for (const btn of items) {
-      const t = (btn.textContent || "").trim();
-      // 侧边栏会话条目：短文本、非当前会话、非功能区按钮
-      if (t && t.length < 30 && !t.includes(chatName) && !/新任务|⌘|扩展|技能|连接器|定时|网页|频道|项目|反馈/.test(t)) return btn;
+  /* 视图重挂：**只回当前会话**——整页重载（URL 带 ?chat= 参数，重载即回原会话）。
+   * 旧"点走点回"会去点其它会话条目，违反"编辑/重新生成绝不离开当前对话"不变式，
+   * 且是"跳到其他对话"的唯一来源，已废除。
+   * 重载后本脚本上下文消失：需跨重载续行的动作用 savePending 挂起，注入启动时接续。
+   * 注：曾观察"重载后立即大量 tRPC 查询"致渲染进程假死——接续仅做轻量回填/官方输入框发送。 */
+  const PENDING_KEY = "qw-edit-pending";
+  function savePending(obj) { try { sessionStorage.setItem(PENDING_KEY, JSON.stringify({ ...obj, ts: Date.now() })); } catch {} }
+  async function restorePending() {
+    let p = null;
+    try {
+      const raw = sessionStorage.getItem(PENDING_KEY);
+      if (raw) { sessionStorage.removeItem(PENDING_KEY); p = JSON.parse(raw); }
+    } catch {}
+    if (!p || !p.kind || Date.now() - (p.ts || 0) > 60000) return;
+    const ta = await waitComposer(8000);
+    if (!ta) {
+      // 输入框迟迟未就绪：不把原文吞进 sessionStorage 死档，弹窗留存供复制
+      uiPrompt(p.text || "").catch(() => {});
+      toast("输入框未就绪，原文已弹窗留存，可复制后手动发送", "warn");
+      return;
     }
-    return null;
-  }
-  /* 无重载视图刷新：点走 → 点回。React Query staleTime=0，组件重新挂载即 refetch。
-   * 会话名实时从 listSidebar 取（自动标题会改写会话名，创建时的名字会失效）；
-   * 点走目标也从列表取真实会话（避免误点功能区按钮）。URL ?chat= 校验落点。 */
-  async function rebindView(chatId, chatNameHint) {
-    let chats = await q("chats.listSidebar");
-    chats = Array.isArray(chats) ? chats : (chats?.json ?? chats?.chats ?? []);
-    const me = chats.find((c) => c.id === chatId);
-    const myName = me?.name ?? chatNameHint;
-    // 1. 点走（任一其他真实会话，让目标视图卸载）
-    const other = chats.find((c) => c.id !== chatId);
-    if (other && sidebarItemsByName(other.name).length) {
-      sidebarItemsByName(other.name)[0].click();
-      await sleep(700);
-    }
-    // 2. 点回（当前实时名字优先，旧名兜底）；URL 落对后还要等消息真正渲染
-    const rendered = async () =>
-      document.querySelectorAll('div[class*="container/user-message"],div[class*="container/assistant-message"]').length > 0
-      || document.querySelector("textarea:not([readonly]), [contenteditable='true']"); // 空会话也算就绪
-    for (const name of [myName, chatNameHint].filter(Boolean)) {
-      for (const btn of sidebarItemsByName(name)) {
-        btn.click();
-        await sleep(700);
-        if (!location.search.includes(chatId)) continue;
-        // URL 已落对：等视图渲染完成（最多 6s），期间内容可能仍在加载
-        for (let i = 0; i < 12; i++) {
-          if (await rendered()) { log("rebindView ok:", name); return true; }
-          await sleep(500);
-        }
-        log("rebindView: url ok but view not rendered yet");
-        return true; // 落点正确，渲染交给时间
+    if (p.kind === "edit-draft") {
+      if (p.chatId && currentChatId() !== p.chatId) {
+        toast("已离开原会话，未回填草稿（防发错对话）", "warn");
+        return;
       }
+      fillComposer(p.text || "");
+      toast("已重置会话，原文已回填，修改后直接发送");
+    } else if (p.kind === "regen-send") {
+      if (p.chatId && currentChatId() !== p.chatId) {
+        toast("已离开原会话，未自动重发（防发错对话），原文如下可手动粘贴", "warn");
+        return;
+      }
+      let sent = await sendViaComposer(p.text || "", p.subChatId, p.chatId);
+      if (!sent && p.subChatId && p.chatId) {
+        // 输入框路径失败 → tRPC 直提兜底（新 sub 在等待，绝不让会话停在空壳）
+        try {
+          const input = { subChatId: p.subChatId, chatId: p.chatId, prompt: p.text || "", cwd: p.cwd || "", historyEnabled: true };
+          if (p.mode) input.mode = p.mode;
+          await m("agent.submitMessage", input);
+          sent = true;
+          setTimeout(() => location.reload(), 400); // 直提对渲染层不可见 → 回本会话重载显示
+        } catch {}
+      }
+      if (sent) toast("已重置会话并重新生成中…");
+      else { fillComposer(p.text || ""); toast("无法自动发送，原文已回填，请手动发送", "warn"); }
     }
-    toast("[qw-edit] 新回答已生成，请点击左侧对应会话名查看", "warn");
-    return false;
+  }
+  async function rebindView(chatId, chatNameHint) {
+    // 重载前把 URL 的 chat 参数写正：新任务原地首发场景 URL 停在旧会话，
+    // 直接 reload 会落回旧会话而不是刚重置的那个
+    try {
+      if (chatId) {
+        const u = new URL(location.href);
+        if (u.searchParams.get("chat") !== chatId) { u.searchParams.set("chat", chatId); history.replaceState(null, "", u.toString()); }
+      }
+    } catch {}
+    setTimeout(() => location.reload(), 250);
+    return true;
   }
   /* 回答完成（streamId 清空）后再刷新一次，确保最终答案可见 */
   function rebindAfterCompletion(chatId, chatName, subChatId, maxSec = 180) {
@@ -637,17 +664,52 @@
     }
     return null;
   }
+  /* 在当前会话内定位被点用户消息（1.2.5 列表窗口化：不跨会话搜索、不数全局序数；
+   * 同文本多条时用「前后邻居对齐」消歧，对不上宁停不错） */
+  async function locateUserMsgInCurrentChat(bubble) {
+    const chatId = currentChatId();
+    if (!chatId) throw opErr("cannot-confirm-target", "无法确认当前会话，请重新进入对话后重试");
+    const { chat, subs } = await chatDetail(chatId);
+    const sub = subs[0];
+    if (!sub) throw opErr("cannot-confirm-target", "无法确认当前会话，请重新进入对话后重试");
+    const all = await loadMessages(sub.id);
+    const expect = bubblePureText(bubble);
+    if (!norm(expect)) throw opErr("cannot-locate-prompt", "无法识别所点消息内容，请滚动到该消息附近后重试");
+    // 点击瞬间同步快照：同文本相对序数 + 前后邻居气泡文本
+    const uSel = 'div[class*="container/user-message"]';
+    const rowsAll = [...document.querySelectorAll(uSel)];
+    const idx = rowsAll.indexOf(bubble);
+    const snapPrev = idx > 0 ? norm(bubblePureText(rowsAll[idx - 1])).slice(0, 20) : null;
+    const snapNext = idx >= 0 && idx < rowsAll.length - 1 ? norm(bubblePureText(rowsAll[idx + 1])).slice(0, 20) : null;
+    const rel = bubbleOrdinalAmong(bubble, "user", expect, "prefix");
+    const sameText = all.filter((x) => x.role === "user" && textConsistent(x.text, expect, "prefix"));
+    if (!sameText.length) throw opErr("cannot-locate-prompt", "当前会话内定位不到这条消息（列表未加载完整？），请滚动到该消息后重试");
+    let msg = null;
+    if (sameText.length === 1) msg = sameText[0];
+    else {
+      const near = (a, b) => !!a && !!b && (a === b || a.startsWith(b) || b.startsWith(a));
+      let best = null, bestScore = -1;
+      const usersOnly = all.filter((x) => x.role === "user");
+      sameText.forEach((x) => {
+        const i = usersOnly.indexOf(x);
+        const pv = i > 0 ? norm(usersOnly[i - 1].text).slice(0, 20) : null;
+        const nx = i < usersOnly.length - 1 ? norm(usersOnly[i + 1].text).slice(0, 20) : null;
+        let sc = 0;
+        if (near(snapPrev, pv)) sc += 2;
+        if (near(snapNext, nx)) sc += 1;
+        if (sc > bestScore) { bestScore = sc; best = x; }
+      });
+      if (best && bestScore > 0) msg = best;
+      else if (rel >= 0 && rel < sameText.length && sameText.length <= rowsAll.length) msg = sameText[rel];
+      else throw opErr("ordinal-mismatch", "窗口化列表定位不确定，请滚动到该消息附近后重试");
+    }
+    return { msg, all, chat, sub };
+  }
   async function onEdit(btn, bubble) {
     const _html = btn.innerHTML; // 保存原始内容，结束时原样恢复（修文字标签丢失 bug）
     btn.disabled = true; btn.textContent = "…";
     try {
-      const ordinal = bubbleOrdinal(bubble, 'div[class*="container/user-message"]');
-      // 同文本相对序数在点击瞬间同步快照（await 期间 React 可能重渲染使 bubble 失联）
-      const relOrdinal = bubbleOrdinalAmong(bubble, "user", bubblePureText(bubble), "exact");
-      const hits = await findMessages(bubblePureText(bubble), { role: "user", mode: "exact" });
-      const hit = pickByOrdinal(hits, "user", ordinal, bubblePureText(bubble), "exact", relOrdinal);
-      if (!hit) throw opErr("cannot-confirm-target", "无法确认这条消息属于当前会话：请切换到其他会话再切回来后重试");
-      const { msg, all, chat, sub } = hit;
+      const { msg, all, chat, sub } = await locateUserMsgInCurrentChat(bubble);
       const anchor = anchorBefore(all, msg.sequence);
       if (anchor) {
         // 二次确认：回退是破坏性操作（锚点之后的内容从会话移除），防误点
@@ -661,13 +723,12 @@
         toast("已回退到该消息之前" + linesMsg(r) + "，修改后直接发送");
       } else {
         // 首条消息：无锚点 → 重建 subChat（投影清零，全新上下文，原消息保留在历史聊天里）
-        if (!(await uiConfirm({ title: "编辑重发", body: "这是会话的第一条消息，将清空本会话并回填原文（编辑后直接发送）。\n\n继续？", confirmText: "重置会话" }))) return;
+        if (!(await uiConfirm({ title: "编辑重发", body: "这是会话的第一条消息。\n「重置」会把现有消息从本会话中删除（磁盘转录文件仍保留作审计），原文回填输入框供你修改后发送。\n\n继续？", confirmText: "重置会话" }))) return;
         btn.textContent = "…";
-        const newSub = await withLock(sub.id, () => firstTurnReinit({ chatId: chat.id, sub }));
-        await rebindView(chat.id, chat.name || ""); // 重建 subChat 无广播 → 点走点回重新挂载（无重载）
-        await waitComposer();
-        await fillComposer(msg.text);
-        toast("已重置会话，原文已回填，修改后直接发送");
+        await withLock(sub.id, () => firstTurnReinit({ chatId: chat.id, sub }));
+        savePending({ kind: "edit-draft", text: msg.text, chatId: chat.id });
+        await rebindView(chat.id, chat.name || ""); // sub 重建 → 整页重载回本会话；回填由 restorePending 接续
+        return;
       }
     } catch (e) {
       fail(e);
@@ -698,8 +759,8 @@
       if (!userBubble) throw opErr("no-prompt", "这条回答之前没有提问，无法重新生成");
       const promptText = bubblePureText(userBubble);
       if (!norm(promptText)) throw opErr("no-prompt", "这条回答之前没有提问，无法重新生成");
-      // 2. 当前会话（URL chatId → 当前子会话），不跨会话搜索
-      const chatId = new URLSearchParams(location.search).get("chat");
+      // 2. 当前会话（侧边栏激活行为权威，URL 兜底），不跨会话搜索
+      const chatId = currentChatId();
       if (!chatId) throw opErr("cannot-confirm-target", "无法确认当前会话，请重新进入对话后重试");
       const { chat, subs } = await chatDetail(chatId);
       const sub = subs[0];
@@ -724,33 +785,32 @@
         toast("已回退" + linesMsg(r) + "，重新生成中…");
       } else {
         // 第一组对话：无锚点 → 重建 subChat + 自动重发
-        if (!(await uiConfirm({ title: "重新生成", body: "这是会话的第一组对话，将重置会话并用原提问重新生成（消耗一次模型调用）。\n\n继续？", confirmText: "重置并重新生成" }))) return;
+        if (!(await uiConfirm({ title: "重新生成", body: "这是会话的第一组对话。\n「重置」会把现有消息从本会话中删除（磁盘转录文件仍保留作审计），然后用原提问重新生成（消耗一次模型调用）。\n\n继续？", confirmText: "重置并重新生成" }))) return;
         btn.textContent = "…";
         targetSub = await withLock(sub.id, () => firstTurnReinit({ chatId: chat.id, sub }));
-        await sleep(300);
-        await rebindView(chat.id, chat.name || ""); // 新 subChat 无广播 → 点走点回挂载新视图（仅此一次）
+        savePending({ kind: "regen-send", text: userMsg.text, subChatId: targetSub, chatId: targetChat, cwd: chatCwd(chat), mode: sub?.mode || null });
+        await rebindView(chat.id, chat.name || ""); // sub 重建 → 整页重载回本会话；重发由 restorePending 接续
+        return;
       }
-      // 用原提问重新发送：优先走官方输入框（渲染层自己发起提交 → 流式与最终回答
-      // 原生可见，无需「点走点回」重绑，页面不再跳动；runtime resume 遮蔽文件 →
-      // 上下文为截断后内容）
-      const sent = await sendViaComposer(userMsg.text, targetSub, targetChat);
-      if (!sent) {
-        // 兜底：官方路径未确认提交（Enter 未触发 / 视图不在目标会话等）→
-        // tRPC 直提 + 视图重绑（旧路径；提交对渲染层不可见，需点走点回）
-        const input = {
-          subChatId: targetSub,
-          chatId: targetChat,
-          prompt: userMsg.text,
-          cwd: chatCwd(chat),
-          historyEnabled: true, // 必须：否则助手消息不带 sdkMessageUuid，后续锚点全部失效
-        };
-        if (sub?.mode) input.mode = sub.mode;
-        const r = await m("agent.submitMessage", input);
-        log("resubmit ->", r);
-        await sleep(800);
-        await rebindView(chat.id, chat.name || "");
-        rebindAfterCompletion(chat.id, chat.name || "", targetSub);
-      }
+      // 用原提问重新发送。锚定回退后【必须】tRPC 直提，不走 composer：
+      // 1.2.5 实锤（隔离实验 vs 全链路对比）——composer 提交时客户端会把
+      // 「当前 runtime 的 sessionId」回写进库（submit 路径 sr&&set({sessionId})），
+      // 把我们的重指覆盖回旧会话 → 写旧转录 → ensureProjectionBackfilled 把
+      // 已截断的消息回灌进投影（表现＝"重新生成变成追加"）。
+      // tRPC 直提在重指后走「runtime 不可复用 + 遮蔽转录存在 → resume 遮蔽」正路，
+      // 隔离实验验证 4/4 干净。首轮 reinit 路径（新 sub 无 runtime）不受此影响。
+      const input = {
+        subChatId: targetSub,
+        chatId: targetChat,
+        prompt: userMsg.text,
+        cwd: chatCwd(chat),
+        historyEnabled: true, // 必须：否则助手消息不带 sdkMessageUuid，后续锚点全部失效
+      };
+      if (sub?.mode) input.mode = sub.mode;
+      const r = await m("agent.submitMessage", input);
+      log("resubmit ->", r);
+      // 回答期间视图不动；完成后唯一一次重载显示最终答案（重载走 rebindView 写正 URL）
+      rebindAfterCompletion(chat.id, chat.name || "", targetSub);
     } catch (e) {
       fail(e);
     } finally {
@@ -778,7 +838,7 @@
   async function sendViaComposer(text, subChatId, expectedChatId, timeoutMs = 5000) {
     try {
       // 护栏：当前视图必须是目标会话（防确认/回退期间用户切走导致发错会话）
-      if (expectedChatId && new URLSearchParams(location.search).get("chat") !== expectedChatId) return false;
+      if (expectedChatId && currentChatId() !== expectedChatId) return false;
       const sd0 = await subChatState(subChatId);
       if (sd0?.streamId) return false; // 已有流在跑，不走此路径
       const composer = await waitComposer();
@@ -913,16 +973,26 @@
     try { return new URLSearchParams(location.search).get("chat"); } catch { return null; }
   }
   async function navigateAwayFrom(chatId) {
+    // 优先：按 data-chat-id 精确点其它会话行
+    for (const row of document.querySelectorAll("[data-chat-item][data-chat-id]")) {
+      if (row.getAttribute("data-chat-id") === chatId) continue;
+      const btn = row.querySelector("button");
+      if (!btn) continue;
+      btn.click();
+      await sleep(800);
+      if (currentChatId() !== chatId) return true;
+    }
+    // 兜底：旧版无 data-chat-id → 名字匹配
     const chats = await refreshChatCache(true);
     for (const other of chats.filter((c) => c.id !== chatId).slice(0, 5)) {
       const items = sidebarItemsByName(other.name || "");
       if (items.length) {
         items[0].click();
         await sleep(800);
-        if (!location.search.includes(chatId)) return true;
+        if (currentChatId() !== chatId) return true;
       }
     }
-    return !location.search.includes(chatId);
+    return currentChatId() !== chatId;
   }
   /* 无名会话在侧边栏显示为占位标题「新任务」，与顶部按钮撞文本：
    * 用位置规则识别（y>150 且非头部导航区）。仅当无名会话恰好一条时才认领该行。 */
@@ -944,8 +1014,12 @@
     return null;
   }
   function removeChatRow(ch) {
-    const n = (ch?.name || "").trim();
-    const row = n ? chatRowOf(n) : unnamedRowOf();
+    let row = null;
+    if (ch?.id) row = document.querySelector(`[data-chat-item][data-chat-id="${CSS.escape(ch.id)}"]`);
+    if (!row) {
+      const n = (ch?.name || "").trim();
+      row = n ? chatRowOf(n) : unnamedRowOf();
+    }
     if (row) row.remove();
   }
   async function trashChat(ch, { skipConfirm = false } = {}) {
@@ -954,7 +1028,9 @@
     {
       const n = (ch.name || "").trim();
       const fresh = await refreshChatCache(true);
-      if (n && fresh.filter((c) => (c.name || "").trim() === n).length > 1) {
+      if (!fresh.some((c) => c.id === ch.id)) { toast("会话已变化，请重试", "warn"); return false; }
+      if (n && fresh.filter((c) => (c.name || "").trim() === n).length > 1 &&
+          !document.querySelector(`[data-chat-item][data-chat-id="${CSS.escape(ch.id)}"]`)) {
         toast(`「${n}」存在重名，出于安全请改用「回收站」弹窗勾选删除`, "warn");
         return false;
       }
@@ -1032,10 +1108,28 @@
       counts[n] = (counts[n] || 0) + 1;
       byName.set(n, c);
     }
+    const seen = new Set();
     const side = document.querySelector('[class*="sidebar"]') || document.body;
+    // 优先：data-chat-id 精确挂（无重名歧义，名字唯一性要求仅限无名/旧版路径）
+    let idBased = 0;
+    for (const row of side.querySelectorAll("[data-chat-item][data-chat-id]")) {
+      const ch = chats.find((c) => c.id === row.getAttribute("data-chat-id"));
+      if (!ch) continue;
+      idBased++;
+      if (row.querySelector(":scope > .qw-del-btn")) continue;
+      row.classList.add("qw-chat-row");
+      if (getComputedStyle(row).position === "static") row.style.position = "relative";
+      const b = document.createElement("button");
+      b.className = "qw-del-btn";
+      b.textContent = "🗑";
+      b.title = "删除会话（移入回收站，可恢复）";
+      b.onclick = (ev) => { ev.stopPropagation(); void trashChat(ch); };
+      row.appendChild(b);
+    }
+    if (idBased) return; // 新版：id 精确路径完成
+    // 旧版兜底：名字文本匹配（仅唯一名）
     const walker = document.createTreeWalker(side, NodeFilter.SHOW_TEXT);
     let node;
-    const seen = new Set();
     while ((node = walker.nextNode())) {
       const t = (node.textContent || "").trim();
       if (!t || counts[t] !== 1) continue;
@@ -1193,9 +1287,10 @@
     trpc, findMessages, loadMessages, chatDetail, fillComposer,
     trueRollback, ensureIdle, subChatState, pinHits, daemonOp, toast,
     uiConfirm, uiPrompt, sendViaComposer,
-    firstTurnReinit, rebindView, sidebarItemsByName,
+    firstTurnReinit, rebindView, sidebarItemsByName, currentChatId,
     trashChat, permanentDeleteChats, openAdminModal, refreshChatCache, looksLikeTest,
   };
   setInterval(() => { mountButtons(); void mountTimes(); void mountSidebarDeleteButtons(); mountTrashEntry(); }, 1500);
-  log("v9.17 loaded (unnamed chat row support) (edit/regen + times + composer-send + prompt/time-anchored shadow). 调试入口: window.__qwEdit");
+  setTimeout(() => { void restorePending(); }, 2000);
+  log("v9.24 loaded (drop stale runtime after repoint; cancelStream path fix agent->chats). 调试入口: window.__qwEdit");
 })();
