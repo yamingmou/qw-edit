@@ -563,7 +563,26 @@ async function shadowTruncate({ sessionId, newSessionId, anchorOrdinal, anchorTe
     return { ok: false, error: `anchor-not-located (ordinal=${ordinal}, groups=${groups.length}${anchorText ? ", 锚点文本未唯一命中" : ""}${stopBeforeUserText ? ", 提问未在转录中定位到" : ""})` };
   }
   const idx = g.end;
-  const out = lines.slice(0, idx + 1).map((l) => l.split(sessionId).join(newSessionId));
+  // 1.2.5 实锤：UI 提交转录里有独立 <system-reminder> 用户行/混排提醒段，投影只存干净文本
+  // → resume 时客户端把"转录有投影无"的行回灌投影（=重新生成后冒幽灵重复消息）。
+  // 遮蔽时同步净化：剥提醒段；整行只剩提醒则丢弃，使转录与投影对齐。
+  let droppedRem = 0;
+  const out = lines.slice(0, idx + 1).flatMap((l) => {
+    let obj = null;
+    try { obj = JSON.parse(l); } catch {}
+    if (obj && obj.type === "user" && Array.isArray(obj.message && obj.message.content)) {
+      const parts = obj.message.content.map((pp) => {
+        if (!pp || pp.type !== "text" || typeof pp.text !== "string") return pp;
+        const t2 = pp.text.replace(/<system-reminder>[\s\S]*?(?:<\/system-reminder>|$)/g, " ").replace(/\s+/g, " ").trim();
+        return { ...pp, text: t2 };
+      });
+      const hasReal = parts.some((pp) => !pp || pp.type !== "text" || (pp.text || "").trim());
+      if (!hasReal) { droppedRem++; return []; }
+      obj = { ...obj, message: { ...obj.message, content: parts } };
+      return [JSON.stringify(obj).split(sessionId).join(newSessionId)];
+    }
+    return [l.split(sessionId).join(newSessionId)];
+  });
   const dest = path.join(path.dirname(srcFile), `${newSessionId}.jsonl`);
   try { await statFile(dest); return { ok: false, error: "dest-exists" }; } catch {}
   const { writeFile } = await import("node:fs/promises");
@@ -578,7 +597,31 @@ async function shadowTruncate({ sessionId, newSessionId, anchorOrdinal, anchorTe
   }
   const violations = findForbiddenViolations(out, forbidden, scopeFrom);
   if (violations.length) return { ok: false, error: "forbidden-text-present", violations };
-  return { ok: true, file: dest, lines: out.length, originalLines: lines.length };
+  return { ok: true, file: dest, lines: out.length, originalLines: lines.length, droppedReminders: droppedRem };
+}
+/* REBUILD 模式文件级验证：等 <sessionId>.jsonl（由客户端从截断投影重建）出现，
+ * 校验其中不含被撤回文本。只读。 */
+async function verifySession({ sessionId, originalSessionId, waitMs = 90000 }) {
+  const deadline = Date.now() + waitMs;
+  let file = null;
+  while (Date.now() < deadline) {
+    file = await findSessionFile(sessionId);
+    if (file) break;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (!file) return { ok: false, error: "transcript-not-created-in-time" };
+  await new Promise((r) => setTimeout(r, 1500));
+  const content = await readFile(file, "utf8");
+  const lines = content.split("\n").filter(Boolean).length;
+  let originalLines = null;
+  if (originalSessionId) {
+    const of = await findSessionFile(originalSessionId);
+    if (of) originalLines = (await readFile(of, "utf8")).split("\n").filter(Boolean).length;
+  }
+  if (originalLines != null && lines >= originalLines) {
+    return { ok: false, error: "rebuilt-not-smaller", lines, originalLines };
+  }
+  return { ok: true, file, lines, originalLines };
 }
 /* 每秒轮询各已连接页面：有待处理操作则执行并回填结果 */
 const OP_POLL_MS = 1000;
@@ -592,7 +635,10 @@ async function pollOps() {
       });
       const req = r?.result?.value;
       if (!req?.kind) continue;
-      const result = req.kind === "shadow" ? await shadowTruncate(req) : { ok: false, error: "unknown-op" };
+      let result;
+      if (req.kind === "shadow") result = await shadowTruncate(req);
+      else if (req.kind === "verify") result = await verifySession(req);
+      else result = { ok: false, error: "unknown-op" };
       result.id = req.id;
       log("op", req.kind, "->", result.ok ? `ok (${result.lines}/${result.originalLines} lines)` : result.error);
       await cdpCall(ws, ++cdpSeq, "Runtime.evaluate", {
