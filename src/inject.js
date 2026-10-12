@@ -275,59 +275,69 @@
     const fn = opResolvers.get(r?.id);
     if (fn) { opResolvers.delete(r?.id); fn(r); }
   };
-  function daemonOp(req) {
+  function daemonOp(req, timeoutMs = 10000) {
     return new Promise((resolve) => {
       const id = Math.random().toString(36).slice(2);
-      const timer = setTimeout(() => { opResolvers.delete(id); resolve({ ok: false, error: "op-timeout" }); }, 10000);
+      const timer = setTimeout(() => { opResolvers.delete(id); resolve({ ok: false, error: "op-timeout" }); }, timeoutMs);
       opResolvers.set(id, (r) => { clearTimeout(timer); resolve(r); });
       opQueue.push({ id, ...req });
     });
   }
 
-  /* ---------- 6. 核心：trueRollback（遮蔽方案，原地不动会话） ---------- */
-  /* 返回 {lines, originalLines}；任何失败都抛带 code 的错误。
-   * 顺序：先投影截断前的验证（遮蔽文件建好且验证过），再截断投影，最后重指。
-   * - 遮蔽失败 → 零影响，中止
-   * - 投影截断失败 → 遮蔽文件成惰性孤儿（无害），会话未重指，中止
-   * - 重指失败 → 模型上下文未变（runtime 仍为旧会话），如实报错可重试 */
-  async function trueRollback({ subChatId, anchor, all, forbiddenTexts, stopBeforeTime }) {
+  /* ---------- 6. 核心：trueRollback（REBUILD 模式，1.2.5 定稿） ----------
+   * 回退 = ① chats.rollbackToMessage 截断投影（UI 与上下文的唯一真相）
+   *        ② 会话指向全新 sessionId（无转录文件）
+   * 下次提交时客户端自动「从截断投影重建转录」：转录 ≡ 截断后的投影，
+   * 被遮蔽内容按构造不可能进入模型上下文（隔离实验实证 n=4、零幽灵行）。
+   * 旧「遮蔽转录文件 + 重指」路线在 1.2.5 会触发 runtime 回放/投影回灌
+   * （"重新生成变追加"幽灵重复行），已废弃。
+   * 异步诊断：等重建转录落盘，记录行数对比（daemon verifySession）。**仅写日志、不弹窗、不改数据**——
+   * 因原会话与重建会话行数关系受 runtime 事件行数波动影响，做数值断言会假阳性（评审 #5）；
+   * 真失忆由「先重指新 session、再截投影、循环到稳定、终检 survivors 为空」的构造性保证 +
+   * 一次性实测文件级验证（重建转录真实用户轮只含存活消息）覆盖。 */
+  async function trueRollback({ subChatId, anchor, all, forbiddenTexts, verify }) {
     await ensureIdle(subChatId);
     const src = await subChatState(subChatId);
-    const originalSessionId = src?.sessionId ?? undefined;
-    if (!originalSessionId) throw opErr("no-session", "该会话没有可回退的上下文");
-
-    // 锚点序数：投影中该锚点之前的助手消息数（含自身）= 转录中第 N 组 assistant 行
-    const anchorOrdinal = all.filter((x) => x.role === "assistant" && x.sequence <= anchor.sequence).length;
-
-    // 1. 遮蔽文件：截断到锚点（daemon 只新增文件，不改原文件）+ 验证
-    //    stopBeforeUserText = 被撤回的用户提问：daemon 据此在转录里定位截断点
-    //    （「回退到这次提问之前」），不受投影合并转录组的影响；
-    //    stopBeforeTime = 提问发送时间：提问未落盘时（客户端重启丢轮）的时间戳回退
+    const originalSessionId = src?.sessionId || undefined;
+    // 1. 指向全新 session（提交时由客户端从截断投影重建转录）
     const newSessionId = crypto.randomUUID();
-    const r = await daemonOp({
-      kind: "shadow", sessionId: originalSessionId, newSessionId,
-      anchorOrdinal, anchorText: anchor.text, anchorMessageId: anchor.messageId,
-      stopBeforeUserText: forbiddenTexts?.[0],
-      stopBeforeTime,
-      forbidden: forbiddenTexts,
-    });
-    log("shadow ->", r);
-    if (!r?.ok) {
-      throw opErr("shadow-failed", "上下文截断失败，已中止（会话未受影响）：" + (r?.error || "") +
-        (r?.violations ? "（仍含被撤回内容：" + r.violations.join("、") + "）" : ""));
-    }
-
-    // 2. 截断投影（UI 同步；必须在重指之前——保证投影 ⊆ 转录，
-    //    否则客户端 resume 时会检测"转录缺失"并把被撤回内容作为历史注入）
-    const rb = await m("chats.rollbackToMessage", { subChatId, sdkMessageUuid: anchor.sdkMessageUuid });
-    log("rollback ->", rb);
-    if (rb && rb.success === false) throw opErr("rollback-failed", "回退失败: " + (rb.error || "未知错误"));
-
-    // 3. 重指会话（下次提交 resume 遮蔽文件 → 模型失忆）
     await m("chats.updateSubChatSession", { id: subChatId, sessionId: newSessionId });
-    await dropRuntimeFor(subChatId); // 防旧 runtime 回放旧历史污染遮蔽会话
-    log("session repointed ->", newSessionId);
-    return { lines: r.lines, originalLines: r.originalLines, newSessionId };
+    log("rebuild repoint ->", newSessionId);
+    // 2. 截断投影 + 稳定循环。
+    //    v10 隔离实验：1.2.5 里截断后 ~1-3 秒会出现一次性「复活波」（turn-input/事件流
+    //    把刚删的行再物化 1-2 条），一波之后稳定、提交不再触发二次复活。
+    //    对策：截断 → 观察 → 有复活行就再截断；循环后终检，仍不稳定则中止（调用方不会自动提交）。
+    const truncateOnce = async () => {
+      const rb = await m("chats.rollbackToMessage", { subChatId, sdkMessageUuid: anchor.sdkMessageUuid });
+      if (rb && rb.success === false) throw opErr("rollback-failed", "回退失败: " + (rb.error || "未知错误"));
+    };
+    const survivors = async () => {
+      const rows = await loadMessages(subChatId);
+      return rows.filter((x) => x.sequence > anchor.sequence);
+    };
+    await truncateOnce();
+    let bad = [];
+    for (let round = 0; round < 4; round++) {
+      await sleep(1600);
+      bad = await survivors();
+      if (!bad.length) { bad = []; break; }
+      log("stabilize: 复活 " + bad.length + " 行，第 " + (round + 2) + " 次截断");
+      await truncateOnce();
+    }
+    await sleep(1600);
+    bad = await survivors();
+    if (bad.length) {
+      throw opErr("not-stable", "会话存在持续复活行（" + bad.length + " 条），为防错乱已中止。请重开本会话或稍后重试");
+    }
+    // 3. 异步诊断（仅重新生成路径）：等重建转录落盘并记录行数对比。
+    //    行数关系受工具行数波动影响，不作为用户告警依据（评审 #5：只 log 不 toast）。
+    if (verify) {
+      void (async () => {
+        const v = await daemonOp({ kind: "verify", sessionId: newSessionId, originalSessionId, waitMs: 90000 }, 110000);
+        log("verify(diagnostic):", JSON.stringify(v));
+      })();
+    }
+    return { newSessionId, rebuild: true };
   }
 
   /* ---------- 7. 首轮兜底（无锚点）：重建 subChat（投影清零 + 全新上下文） ---------- */
@@ -648,7 +658,7 @@
     toast(`[qw-edit] ${e.message}`, "err");
   }
   function linesMsg(r) {
-    return r?.lines != null ? `（上下文 ${r.originalLines} → ${r.lines} 行，已验证）` : "";
+    return r?.rebuild ? "（历史将以截断后的投影重建，被撤回内容不再进入上下文）" : "";
   }
 
   /* ---- 编辑重发（用户消息）---- */
@@ -664,8 +674,65 @@
     }
     return null;
   }
-  /* 在当前会话内定位被点用户消息（1.2.5 列表窗口化：不跨会话搜索、不数全局序数；
-   * 同文本多条时用「前后邻居对齐」消歧，对不上宁停不错） */
+  /* 在当前会话投影 all 里，精确定位「被点的这条用户气泡」对应的消息。
+   * 编辑与重新生成【共用】此选择器——两者本质是同一问题：命中我实际点击的那条提问。
+   * 顺序（宁停不错，绝不误伤）：
+   *   1. 候选先用【精确相等】圈定（杜绝「前 30 字相同、后文不同」的两条被混进同一候选集）；
+   *      仅当精确为空（带 @提及/附件等使 DOM 文本与转录略有差异）才退回【30 字前缀】兜底。
+   *   2. 唯一候选直接返回。
+   *   3. 多候选：先按「前后邻居对齐」打分取【唯一最高分】；并列则不臆断。
+   *   4. 邻居无法唯一化 → 用「同文相对序数」在候选内定位（点击瞬间同步快照，抗窗口化列表）。
+   *   5. 仍不确定 → 抛 ordinal-mismatch，交调用方提示重试。 */
+  function selectUserMsg(all, bubble) {
+    const expect = bubblePureText(bubble);
+    if (!norm(expect)) throw opErr("cannot-locate-prompt", "无法识别所点消息内容，请滚动到该消息附近后重试");
+    const uSel = 'div[class*="container/user-message"]';
+    const rowsAll = [...document.querySelectorAll(uSel)];
+    const idx = rowsAll.indexOf(bubble);
+    // A1 守卫：本函数全同步（无 await），但进入前调用方已 await(chatDetail/loadMessages)。
+    // 若那期间被点气泡被窗口化列表回收/组件重挂 → bubble 脱离 DOM(idx<0)，
+    // 邻居快照与相对序数全部失去参照，此时【绝不】猜最后一条（旧 M2 错锚的变体），直接宁停。
+    if (idx < 0) throw opErr("ordinal-mismatch", "所点消息已移出可视列表，请滚动到该消息附近后重试");
+    const snapPrev = idx > 0 ? norm(bubblePureText(rowsAll[idx - 1])).slice(0, 20) : null;
+    const snapNext = idx >= 0 && idx < rowsAll.length - 1 ? norm(bubblePureText(rowsAll[idx + 1])).slice(0, 20) : null;
+    // 1) 候选：精确优先，空则前缀兜底（兼容 DOM 与转录文本略有差异的消息）
+    let mode = "exact";
+    let sameText = all.filter((x) => x.role === "user" && textConsistent(x.text, expect, "exact"));
+    if (!sameText.length) {
+      mode = "prefix";
+      sameText = all.filter((x) => x.role === "user" && textConsistent(x.text, expect, "prefix"));
+    }
+    if (!sameText.length) throw opErr("cannot-locate-prompt", "当前会话内定位不到这条消息（列表未加载完整？），请滚动到该消息后重试");
+    sameText = sameText.slice().sort((a, b) => a.sequence - b.sequence);
+    if (sameText.length === 1) return sameText[0];
+    // 2) 多候选：邻居对齐打分，找唯一最高分
+    const near = (a, b) => !!a && !!b && (a === b || a.startsWith(b) || b.startsWith(a));
+    const usersOnly = all.filter((x) => x.role === "user").sort((a, b) => a.sequence - b.sequence);
+    const scoreOf = (x) => {
+      const i = usersOnly.indexOf(x);
+      const pv = i > 0 ? norm(usersOnly[i - 1].text).slice(0, 20) : null;
+      const nx = i < usersOnly.length - 1 ? norm(usersOnly[i + 1].text).slice(0, 20) : null;
+      let sc = 0;
+      if (near(snapPrev, pv)) sc += 2;
+      if (near(snapNext, nx)) sc += 1;
+      return sc;
+    };
+    let best = null, bestScore = -1, tied = 0;
+    sameText.forEach((x) => {
+      const sc = scoreOf(x);
+      if (sc > bestScore) { bestScore = sc; best = x; tied = 1; }
+      else if (sc === bestScore) tied++;
+    });
+    if (best && bestScore > 0 && tied === 1) return best;
+    // 3) 邻居无法唯一化 → 同文相对序数。
+    //    A2 守卫：仅当【同文候选在 DOM 里都渲染出来了】(domSame 计数 == 候选数) 时，
+    //    相对序数才有意义；若部分被虚拟化回收，序数会数错 → 宁停不错。
+    const domSame = rowsAll.filter((el) => textConsistent(bubblePureText(el), expect, mode)).length;
+    const rel = bubbleOrdinalAmong(bubble, "user", expect, mode);
+    if (rel >= 0 && rel < sameText.length && domSame === sameText.length) return sameText[rel];
+    throw opErr("ordinal-mismatch", "窗口化列表定位不确定，请滚动到该消息附近后重试");
+  }
+  /* 在当前会话内定位被点用户消息（1.2.5 列表窗口化：不跨会话搜索、不数全局序数）。 */
   async function locateUserMsgInCurrentChat(bubble) {
     const chatId = currentChatId();
     if (!chatId) throw opErr("cannot-confirm-target", "无法确认当前会话，请重新进入对话后重试");
@@ -673,38 +740,10 @@
     const sub = subs[0];
     if (!sub) throw opErr("cannot-confirm-target", "无法确认当前会话，请重新进入对话后重试");
     const all = await loadMessages(sub.id);
-    const expect = bubblePureText(bubble);
-    if (!norm(expect)) throw opErr("cannot-locate-prompt", "无法识别所点消息内容，请滚动到该消息附近后重试");
-    // 点击瞬间同步快照：同文本相对序数 + 前后邻居气泡文本
-    const uSel = 'div[class*="container/user-message"]';
-    const rowsAll = [...document.querySelectorAll(uSel)];
-    const idx = rowsAll.indexOf(bubble);
-    const snapPrev = idx > 0 ? norm(bubblePureText(rowsAll[idx - 1])).slice(0, 20) : null;
-    const snapNext = idx >= 0 && idx < rowsAll.length - 1 ? norm(bubblePureText(rowsAll[idx + 1])).slice(0, 20) : null;
-    const rel = bubbleOrdinalAmong(bubble, "user", expect, "prefix");
-    const sameText = all.filter((x) => x.role === "user" && textConsistent(x.text, expect, "prefix"));
-    if (!sameText.length) throw opErr("cannot-locate-prompt", "当前会话内定位不到这条消息（列表未加载完整？），请滚动到该消息后重试");
-    let msg = null;
-    if (sameText.length === 1) msg = sameText[0];
-    else {
-      const near = (a, b) => !!a && !!b && (a === b || a.startsWith(b) || b.startsWith(a));
-      let best = null, bestScore = -1;
-      const usersOnly = all.filter((x) => x.role === "user");
-      sameText.forEach((x) => {
-        const i = usersOnly.indexOf(x);
-        const pv = i > 0 ? norm(usersOnly[i - 1].text).slice(0, 20) : null;
-        const nx = i < usersOnly.length - 1 ? norm(usersOnly[i + 1].text).slice(0, 20) : null;
-        let sc = 0;
-        if (near(snapPrev, pv)) sc += 2;
-        if (near(snapNext, nx)) sc += 1;
-        if (sc > bestScore) { bestScore = sc; best = x; }
-      });
-      if (best && bestScore > 0) msg = best;
-      else if (rel >= 0 && rel < sameText.length && sameText.length <= rowsAll.length) msg = sameText[rel];
-      else throw opErr("ordinal-mismatch", "窗口化列表定位不确定，请滚动到该消息附近后重试");
-    }
+    const msg = selectUserMsg(all, bubble);
     return { msg, all, chat, sub };
   }
+
   async function onEdit(btn, bubble) {
     const _html = btn.innerHTML; // 保存原始内容，结束时原样恢复（修文字标签丢失 bug）
     btn.disabled = true; btn.textContent = "…";
@@ -752,9 +791,8 @@
     const _html = btn.innerHTML; // 保存原始内容，结束时原样恢复（修文字标签丢失 bug）
     btn.disabled = true; btn.textContent = "…";
     try {
-      // 语义定稿（用户）：重新生成 = 直接按提问重新输出整条回答，**不做消息维度计算**——
-      // 不跨会话搜索、不数全局序数/同文相对序数、不算前缀互容、不算完整度。
-      // 1. 取该回答前紧邻的用户提问（DOM 直接读取，天然精确，非计数）
+      // 语义（用户）：重新生成 = 取被点回答【前紧邻的那条提问】原样重发，不跨会话、不算完整度。
+      // 1. 先用 DOM 精确取到该提问气泡（compareDocumentPosition，天然定位点击目标）
       const userBubble = prevUserBubble(bubble);
       if (!userBubble) throw opErr("no-prompt", "这条回答之前没有提问，无法重新生成");
       const promptText = bubblePureText(userBubble);
@@ -766,10 +804,9 @@
       const sub = subs[0];
       if (!sub) throw opErr("cannot-confirm-target", "无法确认当前会话，请重新进入对话后重试");
       const all = await loadMessages(sub.id);
-      // 3. 本会话内按文本定位提问：同文多条取最后一条（对应最近一次提问；无计数）
-      const same = all.filter((x) => x.role === "user" && norm(x.text) === norm(promptText));
-      const userMsg = same[same.length - 1];
-      if (!userMsg) throw opErr("cannot-locate-prompt", "无法定位这条回答对应的提问（列表未加载完整），请稍后重试");
+      // 3. 用与编辑【同款】的严格定位器命中「被点回答前紧邻的那条提问」：
+      //    精确优先→邻居/相对序数消歧→对不上宁停。修复「同会话有重复提问时错锚到最后一条」。
+      const userMsg = selectUserMsg(all, userBubble);
       const anchor = anchorBefore(all, userMsg.sequence);
       let targetSub = sub.id, targetChat = chat.id;
       if (anchor) {
@@ -779,7 +816,7 @@
         // forbidden 只放被撤回轮的用户消息文本。锚点回答必须保留在遮蔽文件里，
         // 不加入 forbidden（锚点与被撤回回答文本相同时会误拦）
         const r = await withLock(sub.id, () =>
-          trueRollback({ subChatId: sub.id, anchor, all, forbiddenTexts: [userMsg.text], stopBeforeTime: userMsg.createdAt }));
+          trueRollback({ subChatId: sub.id, anchor, all, forbiddenTexts: [userMsg.text], stopBeforeTime: userMsg.createdAt, verify: true }));
         btn.textContent = "…";
         await sleep(600);
         toast("已回退" + linesMsg(r) + "，重新生成中…");
@@ -968,9 +1005,6 @@
       chatCache = { ts: Date.now(), chats };
     } catch { /* 保留旧缓存 */ }
     return chatCache.chats;
-  }
-  function currentChatId() {
-    try { return new URLSearchParams(location.search).get("chat"); } catch { return null; }
   }
   async function navigateAwayFrom(chatId) {
     // 优先：按 data-chat-id 精确点其它会话行
@@ -1183,6 +1217,7 @@
           <button data-act="trash-sel" class="qw-admin-btn">移入回收站(所选)</button>
           <button data-act="restore-sel" class="qw-admin-btn">恢复(所选)</button>
           <button data-act="purge-sel" class="qw-admin-btn qw-admin-danger">彻底删除(所选)</button>
+          <button data-act="empty-trash" class="qw-admin-btn qw-admin-danger">一键清空回收站</button>
           <button data-act="close" class="qw-admin-btn">关闭</button>
         </div>
       </div>`;
@@ -1266,6 +1301,21 @@
       await permanentDeleteChats(items);
       await reload();
     });
+    ov.querySelector('[data-act="empty-trash"]').onclick = () => void runExclusive(async () => {
+      let d = await q("chats.listDeleted", {}); d = d?.json ?? d;
+      const trash = Array.isArray(d) ? d : (d?.chats ?? d?.items ?? []);
+      if (!trash.length) { toast("回收站已是空的", "warn"); return; }
+      const ok = await uiConfirm({
+        title: "一键清空回收站",
+        body: `回收站内共 ${trash.length} 个会话，将被【全部永久删除】（不可恢复，关联工作区文件一并清理）。\n\n这不是"移入回收站"，是真正删干净。确认清空？`,
+        confirmText: "我知道，清空",
+        danger: true,
+      });
+      if (!ok) return;
+      const n = await permanentDeleteChats(trash); // 内部还会做一次"最后确认"
+      toast(n ? `已清空回收站（${n} 项）` : "未删除任何会话");
+      await reload();
+    });
     await reload();
   }
   /* 入口：fixed 悬浮在顶部标题栏（logo 右侧空位）。标题栏是拖拽区，须声明 no-drag */
@@ -1289,8 +1339,9 @@
     uiConfirm, uiPrompt, sendViaComposer,
     firstTurnReinit, rebindView, sidebarItemsByName, currentChatId,
     trashChat, permanentDeleteChats, openAdminModal, refreshChatCache, looksLikeTest,
+    selectUserMsg,
   };
   setInterval(() => { mountButtons(); void mountTimes(); void mountSidebarDeleteButtons(); mountTrashEntry(); }, 1500);
   setTimeout(() => { void restorePending(); }, 2000);
-  log("v9.24 loaded (drop stale runtime after repoint; cancelStream path fix agent->chats). 调试入口: window.__qwEdit");
+  log("v9.29 loaded (REBUILD + stabilization w/ final check; shared strict selectUserMsg for edit+regen; single currentChatId; verify diagnostic-only; 回收站一键清空). 调试入口: window.__qwEdit");
 })();

@@ -599,6 +599,30 @@ async function shadowTruncate({ sessionId, newSessionId, anchorOrdinal, anchorTe
   if (violations.length) return { ok: false, error: "forbidden-text-present", violations };
   return { ok: true, file: dest, lines: out.length, originalLines: lines.length, droppedReminders: droppedRem };
 }
+/* REBUILD 模式文件级验证：等 <sessionId>.jsonl（由客户端从截断投影重建）出现，
+ * 校验其中不含被撤回文本。只读。 */
+async function verifySession({ sessionId, originalSessionId, waitMs = 90000 }) {
+  const deadline = Date.now() + waitMs;
+  let file = null;
+  while (Date.now() < deadline) {
+    file = await findSessionFile(sessionId);
+    if (file) break;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  if (!file) return { ok: false, error: "transcript-not-created-in-time" };
+  await new Promise((r) => setTimeout(r, 1500));
+  const content = await readFile(file, "utf8");
+  const lines = content.split("\n").filter(Boolean).length;
+  let originalLines = null;
+  if (originalSessionId) {
+    const of = await findSessionFile(originalSessionId);
+    if (of) originalLines = (await readFile(of, "utf8")).split("\n").filter(Boolean).length;
+  }
+  if (originalLines != null && lines >= originalLines) {
+    return { ok: false, error: "rebuilt-not-smaller", lines, originalLines };
+  }
+  return { ok: true, file, lines, originalLines };
+}
 /* 每秒轮询各已连接页面：有待处理操作则执行并回填结果 */
 const OP_POLL_MS = 1000;
 async function pollOps() {
@@ -611,7 +635,10 @@ async function pollOps() {
       });
       const req = r?.result?.value;
       if (!req?.kind) continue;
-      const result = req.kind === "shadow" ? await shadowTruncate(req) : { ok: false, error: "unknown-op" };
+      let result;
+      if (req.kind === "shadow") result = await shadowTruncate(req);
+      else if (req.kind === "verify") result = await verifySession(req);
+      else result = { ok: false, error: "unknown-op" };
       result.id = req.id;
       log("op", req.kind, "->", result.ok ? `ok (${result.lines}/${result.originalLines} lines)` : result.error);
       await cdpCall(ws, ++cdpSeq, "Runtime.evaluate", {
