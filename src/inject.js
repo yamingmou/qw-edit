@@ -1339,9 +1339,26 @@
     uiConfirm, uiPrompt, sendViaComposer,
     firstTurnReinit, rebindView, sidebarItemsByName, currentChatId,
     trashChat, permanentDeleteChats, openAdminModal, refreshChatCache, looksLikeTest,
-    selectUserMsg,
+    selectUserMsg, scheduleMount,
   };
-  setInterval(() => { mountButtons(); void mountTimes(); void mountSidebarDeleteButtons(); mountTrashEntry(); }, 1500);
+  /* 挂载调度（性能关键）：不再每 1.5s 全量轮询——
+   * 流式/滚动时 React 频繁重建气泡 DOM，轮询会与其互撕（消融实测贡献 ~2/3 长任务）。
+   * 改为 MutationObserver 变化驱动 + requestIdleCallback 空闲期执行；
+   * 4s setInterval 兜底走同一幂等 tick（成本≈一次 querySelectorAll 扫描）。 */
+  let mountScheduled = false;
+  function scheduleMount() {
+    if (mountScheduled || window.__qwPause) return;
+    mountScheduled = true;
+    const run = () => {
+      try { if (!window.__qwPause) { mountButtons(); void mountTimes(); void mountSidebarDeleteButtons(); mountTrashEntry(); } } catch (e) { console.warn("[qw-edit] mount tick failed:", e); }
+      setTimeout(() => { mountScheduled = false; }, 0); // 末尾复位：run 引发的 DOM 变化被 observer 先于此 timer 吞掉，避免冗余空扫
+    };
+    if (typeof requestIdleCallback === "function") requestIdleCallback(run, { timeout: 400 });
+    else setTimeout(run, 150);
+  }
+  try { new MutationObserver(scheduleMount).observe(document.body, { childList: true, subtree: true, characterData: true }); } catch (e) { console.warn("[qw-edit] MutationObserver unavailable:", e); }
+  setInterval(() => scheduleMount(), 4000);
+  scheduleMount(); // 启动即挂载（否则静止视图上按钮要等 4s 兜底）
   setTimeout(() => { void restorePending(); }, 2000);
-  log("v9.29 loaded (REBUILD + stabilization w/ final check; shared strict selectUserMsg for edit+regen; single currentChatId; verify diagnostic-only; 回收站一键清空). 调试入口: window.__qwEdit");
+  log("v9.30 loaded (REBUILD + stabilization w/ final check; shared strict selectUserMsg for edit+regen; single currentChatId; verify diagnostic-only; 回收站一键清空; 挂载改 MutationObserver+idle 驱动，修复与 React 重渲染互撕导致的滚动/打开卡顿). 调试入口: window.__qwEdit");
 })();
