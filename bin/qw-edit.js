@@ -217,6 +217,11 @@ function setTakeover(on) {
 function usage() {
   console.log(`qw-edit v${VERSION} — 千问办公「编辑撤回 / 重新生成 / 消息时间」增强
 
+⚠️  本项目已归档停更（2026-11-25）
+   千问办公 2.1.0 已原生支持「重新编辑 / 重新生成 / 派生任务 / 删除到回收站」，
+   本工具在 2.1.0 上已失效，不再维护。仍在旧版客户端上使用的，可参考下方命令。
+   详见 https://github.com/yamingmou/qw-edit
+
 用法:
   qw-edit install    安装并启动（macOS: launchd；Windows: 任务计划）
   qw-edit uninstall  卸载

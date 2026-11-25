@@ -1,7 +1,7 @@
 {
   "name": "qw-edit",
-  "version": "0.3.2",
-  "description": "为千问办公 (QwenWork) macOS / Windows 客户端加上「编辑撤回 / 重新生成 / 消息时间」能力 —— CDP 注入，不修改客户端本体，更新免疫",
+  "version": "0.4.0",
+  "description": "【已归档停更】千问办公 2.1.0 已原生支持编辑撤回/重新生成/分支/删除，本项目不再维护。此处仅保留「不侵入式能力补全」的技术记录",
   "type": "module",
   "bin": {
     "qw-edit": "bin/qw-edit.js"
