@@ -1,32 +1,37 @@
 /**
  * qw-edit userscript v9 — 在 QwenWork 渲染进程主世界运行。
  *
- * 架构（遮蔽方案，借鉴 dsh-retrace 的 surface 遮蔽思想）：
- *   模型上下文 = CLI 会话转录（jsonl）。撤回不动原转录（审计轨迹保留），
- *   而是让客户端"看到"一个截断视图：
- *     1. daemon 新建遮蔽文件 <newSessionId>.jsonl（原文件截断到锚点行）
- *     2. chats.rollbackToMessage 截断消息投影（UI 同步）
- *     3. chats.updateSubChatSession 重指会话到 newSessionId
- *   下次提交时客户端检测 runtime 不可复用 + 转录文件存在 → resume 遮蔽文件
- *   → 模型上下文 = 截断后内容（真失忆）。
+ * 架构（REBUILD 模式，1.4.0 定稿）：
+ *   模型上下文 = CLI 会话转录（jsonl）。撤回两步：
+ *     1. chats.rollbackToMessage 截断消息投影（UI 同步；截断后有"回灌复活波"，稳定循环吃掉）
+ *     2. chats.updateSubChatSession 重指会话到【全新 uuid】（转录文件不存在）
+ *   下次提交时客户端检测 runtime 不可复用 + 转录缺失 → 从截断后的投影重建转录
+ *   → 模型上下文 = 截断后内容（真失忆，构造性保证：被遮蔽行无处可来）。
  *   顺序关键：投影先截断再重指，保证投影 ⊆ 转录，避免触发客户端的
  *   "transcript truncated → 注入缺失历史"补偿路径。
+ *
+ * 引擎代系（detectEra，实测 1.4.0）：
+ *   旧引擎会话的助手消息带 metadata.sdkMessageUuid（官方截断唯一认的锚点）；
+ *   1.4.0 新会话不再写该字段 → 中间消息无法截断，工具如实拒绝（防假回退）。
+ *   第一条消息不依赖锚点：deleteSubChat + createSubChat 重建（投影清零、上下文全新），
+ *   新旧引擎均可用。
  *
  * 操作原语（全部走客户端内部 tRPC / desktopApi）：
  *   chats.listSidebar / get / listBySubChat   定位消息
  *   chats.getSubChat                           读取会话状态（sessionId / streamId）
  *   agent.cancelStream / agent.cancel          忙时护栏：停止进行中的回答（降级链）
- *   chats.rollbackToMessage                    截断消息投影（官方原语）
+ *   chats.rollbackToMessage                    截断消息投影（官方原语，需锚点）
  *   chats.updateSubChatSession                 重指会话（官方原语）
- *   agent.submitMessage                        发送消息
+ *   chats.deleteSubChat / createSubChat        首轮重建（官方原语，无需锚点）
+ *   agent.submitMessage / composer 原生发送    发送消息
  *
  * 安全纪律（学自 dsh-retrace host-core）：
  *   - 每个操作返回 {ok, error:{code}} 信封，绝不静默半失败
  *   - 同一会话同时只允许一个回退操作（锁）
  *   - agent 忙时自动停止并等待收尾（agent-busy）
  *   - 目标会话与当前可见对话交叉验证（DOM 锚定，防误伤）
- *   - 遮蔽文件必须通过验证（锚点定位成功 + 被撤回文本不在场）才继续
- *   - 原文件永不修改/删除（append-only 审计轨迹）
+ *   - 定位不确定（文本歧义/气泡失联/列表残缺）一律宁停不错
+ *   - 破坏性操作执行前二次确认，文案如实说明后果
  */
 (() => {
   if (window.__qwEdit) return; // 防重复注入
@@ -138,10 +143,37 @@
         (b.updatedAt ?? b.createdAt ?? 0).toString().localeCompare((a.updatedAt ?? a.createdAt ?? 0).toString())),
     };
   }
-  async function loadMessages(subChatId) {
-    const data = await q("chats.listBySubChat", { subChatId, limit: 200 });
-    const list = Array.isArray(data) ? data : (data?.messages ?? []);
-    return list.map((x) => ({
+  async function loadMessages(subChatId, { maxPages = 50 } = {}) {
+    // 1.4.0 服务端 limit≤200（default 80）：长会话必须经 beforeSequence 向更早翻页，
+    // 否则只拿到一页 → 定位/锚点看到的世界是残缺的（宁全勿缺）。
+    // M2 容错：旧版 schema 若拒绝未知参数 beforeSequence，首页成功后续页失败 → 降级为部分加载。
+    // S3 触顶：maxPages 用尽仍可能有更早消息 → qwCapped 标志，调用方据此拒绝破坏性操作。
+    const raw = [];
+    const seen = new Set();
+    let before;
+    let capped = false;
+    for (let p = 0; p < maxPages; p++) {
+      let page;
+      try {
+        const data = await q("chats.listBySubChat", Object.assign({ subChatId, limit: 200 }, before !== undefined ? { beforeSequence: before } : {}));
+        page = Array.isArray(data) ? data : (data?.messages ?? []);
+      } catch (e) {
+        if (p === 0) throw e; // 首页失败是硬错误（会话不存在等）——照旧抛出
+        capped = true; break; // 翻页降级＝数据可能残缺（S5：不许静默当完整）
+      }
+      if (!page.length) break; // 空页＝正常到底
+      let added = 0;
+      for (const x of page) if (!seen.has(x.id)) { seen.add(x.id); raw.push(x); added++; }
+      if (page.length < 200) break; // 短页＝已到底，绝不发起翻页（旧客户端 schema 可能拒绝 beforeSequence，M6：误标 capped 会废掉首轮重置）
+      const minSeq = Math.min(...page.map((x) => x.sequence ?? Infinity));
+      if (!added || !Number.isFinite(minSeq) || (before !== undefined && minSeq >= before)) { // 异常形态：按残缺处理
+        if (p > 0) capped = true;
+        break;
+      }
+      if (p === maxPages - 1) capped = true; // 满页且用尽翻页额度 → 可能还有更早的没拿到
+      before = minSeq;
+    }
+    const arr = raw.map((x) => ({
       subChatId,
       messageId: x.id,
       sdkMessageUuid: x.metadata?.sdkMessageUuid ?? undefined,
@@ -152,7 +184,9 @@
       role: x.role,
       text: extractText(x),
       createdAt: x.createdAt ?? undefined,
-    }));
+    })).sort((a, b) => a.sequence - b.sequence);
+    try { Object.defineProperty(arr, "qwCapped", { value: capped, enumerable: false }); } catch {}
+    return arr;
   }
   async function findMessages(text, { role = "user", mode = "exact", limitChats = 10, limitSubs = 3 } = {}) {
     let chats = await q("chats.listSidebar");
@@ -166,7 +200,7 @@
         const { chat, subs } = await chatDetail(c.id);
         for (const s of subs.slice(0, limitSubs)) {
           let msgs;
-          try { msgs = await loadMessages(s.id); } catch { continue; }
+          try { msgs = await loadMessages(s.id, { maxPages: 3 }); } catch { continue; } // 调试路径限深（N5）
           for (const msg of msgs) {
             if (msg.role !== role) continue;
             const st = norm(msg.text);
@@ -266,6 +300,59 @@
     return cands.filter((x) => x.status === "completed").sort((a, b) => b.sequence - a.sequence)[0]
         ?? cands.sort((a, b) => b.sequence - a.sequence)[0] ?? null;
   }
+  // S1 混代判定（审查 M1 后 fail-closed 三值化）：
+  // old = 最近已完成回答带锚点（或虽无 completed 但有带锚点助手消息——旧引擎仍在写锚）
+  // new = 最近已完成回答不带锚点（引擎切换）
+  // unknown = 判不出（一条带锚证据都没有）→ 与 new 同等对待：拒绝破坏性操作
+  function detectEra(all) {
+    const done = [...all].reverse().find((x) => x.role === "assistant" && x.status === "completed");
+    if (done) return done.sdkMessageUuid ? "old" : "new";
+    return all.some((x) => x.role === "assistant" && x.sdkMessageUuid) ? "old" : "unknown";
+  }
+  function isTrulyFirstPair(msgs, seq) {
+    // M1 防御：sequence 缺失/非数值时 `undefined < undefined` 恒 false，任何目标都会"误判首条"
+    // 进而触发全量重置——形状不可信一律按"非首条"处理（宁拒勿删）。
+    if (!Number.isFinite(seq)) return false;
+    if (msgs.some((x) => !Number.isFinite(x.sequence))) return false;
+    // 目标消息之前是否存在任何助手回答（无论有无锚点字段）
+    return !msgs.some((x) => x.role === "assistant" && x.sequence < seq);
+  }
+  function noAnchorInfo(kind, era, filled) {
+    const act = kind === "regen" ? "重新生成" : "回退";
+    const cause = era === "new"
+      ? "这条对话由新版引擎（1.4.0 实测）驱动，助手消息不再携带回退锚点，官方截断接口（只认该锚点）无法执行——为避免「界面删了、模型却还记得」的假回退，本工具拒绝执行不彻底的截断。若你要处理的是【第一条消息】，它不需要锚点、可直接重置，请滚动到第一条再试。"
+      : "无法判定这条对话的引擎代系，或超长会话加载触顶——找不到可靠的回退锚点。";
+    const fill = filled
+      ? (kind === "regen" ? "原提问已放回输入框：直接发送将作为新一轮追问" : "原文已放回输入框：直接发送将作为新一轮对话") + "（旧历史仍会进入上下文）。"
+      : "输入框不可用或已有你未发送的内容，未做回填——原文见下方，消息本身没有删除，也可在气泡上直接复制。";
+    return {
+      title: "无法安全" + act,
+      body: cause + "为避免「界面删了、模型却还记得」的假" + act + "，本工具拒绝执行不彻底的截断。\n\n"
+          + fill + "想彻底重来，请新建任务。",
+    };
+  }
+  /* 拒绝路径共用：绝不改数据。M2：不走 fillComposer 的 uiPrompt 兜底（那会显示
+   * 「已回退」假成功文案）；输入框不可用/有草稿 → 原文放进本弹窗（S4 放宽到 3000 字）。 */
+  async function refuseNoAnchor(kind, all, text) {
+    const era = detectEra(all);
+    // M11：1.4.0 下 composer 探测纯属空耗，缩短等待；M10：仅旧代 textarea 才回填
+    let filled = false;
+    if (composerIsLegacyTextarea()) {
+      const comp = await waitComposer(1000);
+      if (comp && comp.tagName === "TEXTAREA" && !norm(comp.value ?? "")) {
+        try {
+          comp.focus();
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+          setter.call(comp, text || "");
+          comp.dispatchEvent(new Event("input", { bubbles: true }));
+          filled = true;
+        } catch { filled = false; }
+      }
+    }
+    const info = noAnchorInfo(kind, era, filled);
+    if (!filled && text) info.body += "\n\n—— 原文 ——\n" + String(text).slice(0, 3000);
+    await uiConfirm({ ...info, confirmText: "知道了", cancelText: "关闭", danger: false });
+  }
 
   /* ---------- 5. daemon 操作通道（page → daemon，经 CDP 轮询） ---------- */
   const opQueue = [];
@@ -312,7 +399,7 @@
       if (rb && rb.success === false) throw opErr("rollback-failed", "回退失败: " + (rb.error || "未知错误"));
     };
     const survivors = async () => {
-      const rows = await loadMessages(subChatId);
+      const rows = await loadMessages(subChatId, { maxPages: 2 }); // N4：只需尾部窗口，2 页封顶足够覆盖复活回灌
       return rows.filter((x) => x.sequence > anchor.sequence);
     };
     await truncateOnce();
@@ -386,43 +473,57 @@
       if (raw) { sessionStorage.removeItem(PENDING_KEY); p = JSON.parse(raw); }
     } catch {}
     if (!p || !p.kind || Date.now() - (p.ts || 0) > 60000) return;
-    const ta = await waitComposer(8000);
-    if (!ta) {
-      // 输入框迟迟未就绪：不把原文吞进 sessionStorage 死档，弹窗留存供复制
-      uiPrompt(p.text || "").catch(() => {});
-      toast("输入框未就绪，原文已弹窗留存，可复制后手动发送", "warn");
-      return;
-    }
+    // 1.4.0 起接续路径不再依赖 composer（API 直提/弹窗编辑器），不做输入框前置闸门
+    await sleep(800); // 等页面稳定（重载后轻延）
     if (p.kind === "edit-draft") {
       if (p.chatId && currentChatId() !== p.chatId) {
-        toast("已离开原会话，未回填草稿（防发错对话）", "warn");
+        // R4：pending 已读删，此分支若不留存原文 = 永久丢失（重置已执行，原文是用户唯一的草稿）
+        await uiPrompt(p.text || "");
+        toast("已离开原会话，未回填草稿——原文已弹窗留存（防发错对话）", "warn");
         return;
       }
-      fillComposer(p.text || "");
-      toast("已重置会话，原文已回填，修改后直接发送");
+      if (composerIsLegacyTextarea()) {
+        fillComposer(p.text || "");
+        toast("已重置会话，原文已回填，修改后直接发送");
+      } else if (p.subChatId && p.chatId) {
+        // 1.4.0 自定义编辑器：弹窗编辑 + API 直提（subChatId 是重建后的新线程）
+        // M3：重置已执行——取消弹窗不能吞原文，回落 uiPrompt 留存
+        const sent = await uiEdit({ title: "编辑重发（已重置）", text: p.text || "", send: async (t) => {
+          await apiSubmit({ subChatId: p.subChatId, chatId: p.chatId, prompt: t, cwd: p.cwd, mode: p.mode });
+          setTimeout(() => location.reload(), 400);
+        } });
+        if (!sent) { await uiPrompt(p.text || ""); toast("已重置但取消编辑——原文已弹窗留存，可复制后自行发送", "warn"); }
+      } else {
+        uiPrompt(p.text || "").catch(() => {});
+        toast("已重置会话，原文已弹窗留存，可复制后发送", "warn");
+      }
     } else if (p.kind === "regen-send") {
       if (p.chatId && currentChatId() !== p.chatId) {
-        toast("已离开原会话，未自动重发（防发错对话），原文如下可手动粘贴", "warn");
+        await uiPrompt(p.text || ""); // R4：不留存 = 原文随 pending 永久丢失
+        toast("已离开原会话，未自动重发——原文已弹窗留存，可复制后自行发送（防发错对话）", "warn");
         return;
       }
-      let sent = await sendViaComposer(p.text || "", p.subChatId, p.chatId);
-      if (!sent && p.subChatId && p.chatId) {
-        // 输入框路径失败 → tRPC 直提兜底（新 sub 在等待，绝不让会话停在空壳）
+      let sent = false;
+      // API 直提优先（1.4.0 自定义编辑器下 composer 路径不可靠；新 sub 无 runtime 覆盖问题）
+      if (p.subChatId && p.chatId) {
         try {
-          const input = { subChatId: p.subChatId, chatId: p.chatId, prompt: p.text || "", cwd: p.cwd || "", historyEnabled: true };
-          if (p.mode) input.mode = p.mode;
-          await m("agent.submitMessage", input);
+          await apiSubmit({ subChatId: p.subChatId, chatId: p.chatId, prompt: p.text || "", cwd: p.cwd, mode: p.mode });
           sent = true;
           setTimeout(() => location.reload(), 400); // 直提对渲染层不可见 → 回本会话重载显示
-        } catch {}
+        } catch (e) { log("regen api submit failed:", e); }
       }
+      if (!sent) sent = await sendViaComposer(p.text || "", p.subChatId, p.chatId); // textarea 旧版兜底
       if (sent) toast("已重置会话并重新生成中…");
-      else { fillComposer(p.text || ""); toast("无法自动发送，原文已回填，请手动发送", "warn"); }
+      else { uiPrompt(p.text || "").catch(() => {}); toast("无法自动发送，原文已弹窗留存，请复制后手动发送", "warn"); }
     }
   }
   async function rebindView(chatId, chatNameHint) {
-    // 重载前把 URL 的 chat 参数写正：新任务原地首发场景 URL 停在旧会话，
-    // 直接 reload 会落回旧会话而不是刚重置的那个
+    // 1.5.0 实锤：路由改 hash 后 URL 不再携带 ?chat=，replaceState 写法失效——
+    // 改用官方导航原语（自带整页重载并落回目标会话）；无 desktopApi 的旧环境退回 replaceState+reload
+    if (window.desktopApi && typeof window.desktopApi.openMainWindowWithChat === "function") {
+      setTimeout(() => { try { window.desktopApi.openMainWindowWithChat({ chatId }); } catch { location.reload(); } }, 250);
+      return true;
+    }
     try {
       if (chatId) {
         const u = new URL(location.href);
@@ -494,6 +595,63 @@
       document.addEventListener("keydown", onKey);
       document.body.appendChild(ov);
       ov.querySelector('[data-act="ok"]').focus();
+    });
+  }
+  /* 1.4.0 实锤：composer 是自定义富文本编辑器，程序注入文本（paste/可信键盘/execCommand 全试过）
+   * 只进 DOM 不进应用内部状态 → 点发送无事发生。编辑回填改走【自建弹窗编辑器】（状态我们掌控），
+   * 确认后经官方 API 直提（空闲实测 queued:false、落库+回答完成 ✓）。textarea 旧版仍走输入框。 */
+  async function apiSubmit({ subChatId, chatId, prompt, cwd, mode }) {
+    const input = { subChatId, chatId, prompt, cwd: cwd || "", historyEnabled: true };
+    if (mode) input.mode = mode;
+    return m("agent.submitMessage", input);
+  }
+  function uiEdit({ title = "编辑重发", text = "", send } = {}) {
+    return new Promise((resolve) => {
+      if (modalBusy) { resolve(false); return; }
+      modalBusy = true;
+      let done = false;
+      const close = (val) => {
+        if (done) return; done = true;
+        ov.remove(); document.removeEventListener("keydown", onKey); modalBusy = false; resolve(val);
+      };
+      const ov = document.createElement("div");
+      ov.className = "qw-modal-overlay";
+      ov.innerHTML = `
+        <div class="qw-modal" role="dialog" aria-modal="true">
+          <div class="qw-modal-title">${escHtml(title)}</div>
+          <textarea class="qw-modal-text" spellcheck="false"></textarea>
+          <div class="qw-modal-actions">
+            <button class="qw-modal-btn qw-modal-cancel" data-act="cancel">取消</button>
+            <button class="qw-modal-btn qw-modal-primary" data-act="send">发送</button>
+          </div>
+        </div>`;
+      const ta = ov.querySelector(".qw-modal-text");
+      ta.value = text;
+      const btnSend = ov.querySelector('[data-act="send"]');
+      const btnCancel = ov.querySelector('[data-act="cancel"]');
+      let sending = false; // M2：Cmd/Ctrl+Enter 自动重复会绕过 disabled 重入 doSend → 在途标志串行化
+      const doSend = async () => {
+        if (sending) return;
+        const v = ta.value.trim();
+        if (!v) { toast("内容为空", "warn"); return; }
+        sending = true;
+        btnSend.disabled = true; btnSend.textContent = "发送中…";
+        btnCancel.disabled = true; // R3：在途禁点取消（取消钮的 Enter 原生行为也走 click，keydown 闸门拦不住）
+        try { await send(v); close(true); }
+        catch (e) { sending = false; btnSend.disabled = false; btnSend.textContent = "发送"; btnCancel.disabled = false; toast("发送失败：" + String(e && e.message || e).slice(0, 80), "err"); }
+      };
+      const onKey = (e) => {
+        if (sending) { if (e.key === "Escape") e.preventDefault(); return; } // 在途期间忽略关闭（防"按取消、消息照发"竞态）
+        if (e.key === "Escape") { e.preventDefault(); close(false); }
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void doSend(); }
+      };
+      ov.addEventListener("mousedown", (e) => { if (e.target === ov && !sending) close(false); });
+      btnCancel.onclick = () => { if (!sending) close(false); };
+      btnSend.onclick = () => { void doSend(); };
+      document.addEventListener("keydown", onKey);
+      document.body.appendChild(ov);
+      ta.focus();
+      try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
     });
   }
   /* 回退成功但找不到输入框时的兜底：展示原文 + 一键复制（替代原生 prompt） */
@@ -666,6 +824,13 @@
     const pure = el.querySelector('div[class*="whitespace-pre-wrap"]');
     return (pure ?? el).textContent || "";
   }
+  /* M10：输入框代系判定——存在自定义富文本编辑器（contenteditable）即按"新代"处理，
+   * 绝不因文档序里恰好有个早出现的杂项 textarea 而误判旧代（那会幽灵回填+假成功 toast）。
+   * 排除本工具自己的弹窗文本域。 */
+  function composerIsLegacyTextarea() {
+    if (document.querySelector("[contenteditable='true']")) return false;
+    return !!document.querySelector("textarea:not([readonly]):not(.qw-modal-text)");
+  }
   async function waitComposer(timeout = 6000) {
     for (let i = 0; i < timeout / 200; i++) {
       const el = document.querySelector("textarea:not([readonly]), [contenteditable='true']");
@@ -744,6 +909,8 @@
     return { msg, all, chat, sub };
   }
 
+  /* 拒绝路径共用：见文件头 refuseNoAnchor（M2 fail-closed 版） */
+
   async function onEdit(btn, bubble) {
     const _html = btn.innerHTML; // 保存原始内容，结束时原样恢复（修文字标签丢失 bug）
     btn.disabled = true; btn.textContent = "…";
@@ -751,22 +918,39 @@
       const { msg, all, chat, sub } = await locateUserMsgInCurrentChat(bubble);
       const anchor = anchorBefore(all, msg.sequence);
       if (anchor) {
+        // 锚点即证据（M5）：anchorBefore 本身要求助手消息带 sdkMessageUuid——纯新引擎/unknown 会话必为
+        // null 落到下面分支，不会误进回退；跨代会话目标之前存在旧锚则照常回退（README 承诺的能力）。
         // 二次确认：回退是破坏性操作（锚点之后的内容从会话移除），防误点
-        if (!(await uiConfirm({ title: "编辑重发", body: "将回退到这条消息之前：\n它之后的所有消息（含回答）会从本会话移除（磁盘原文件保留作审计），原输入会放回输入框供你修改重发。\n\n继续？", confirmText: "回退并编辑" }))) return;
+        if (!(await uiConfirm({ title: "编辑重发", body: "将回退到这条消息之前：\n它之后的所有消息（含回答）会从本会话移除（磁盘原文件保留作审计），原文将弹出供你编辑后重新发送。\n\n继续？", confirmText: "回退并编辑" }))) return;
         btn.textContent = "…";
         const r = await withLock(sub.id, () =>
           trueRollback({ subChatId: sub.id, anchor, all, forbiddenTexts: [msg.text], stopBeforeTime: msg.createdAt }));
         // rollback 自带 broadcastChatMessagesInvalidated，UI 会自行刷新，无需重绑
-        await waitComposer();
-        await fillComposer(msg.text);
-        toast("已回退到该消息之前" + linesMsg(r) + "，修改后直接发送");
-      } else {
-        // 首条消息：无锚点 → 重建 subChat（投影清零，全新上下文，原消息保留在历史聊天里）
-        if (!(await uiConfirm({ title: "编辑重发", body: "这是会话的第一条消息。\n「重置」会把现有消息从本会话中删除（磁盘转录文件仍保留作审计），原文回填输入框供你修改后发送。\n\n继续？", confirmText: "重置会话" }))) return;
+        // 草稿回填分流：textarea（旧版输入框）→ 回填输入框自己发；自定义富文本编辑器（1.4.0）→ 弹窗编辑器+API 直提
+        if (composerIsLegacyTextarea()) {
+          await fillComposer(msg.text);
+          toast("已回退到该消息之前" + linesMsg(r) + "，修改后直接发送");
+        } else {
+          // M3：回退已执行——用户取消弹窗不能吞掉原文（pending 已读删），回落 uiPrompt 留存可复制
+          const sent = await uiEdit({ title: "编辑重发（已回退）", text: msg.text, send: async (t) => {
+            await apiSubmit({ subChatId: sub.id, chatId: chat.id, prompt: t, cwd: chatCwd(chat), mode: sub.mode });
+            rebindAfterCompletion(chat.id, chat.name || "", sub.id);
+          } });
+          if (!sent) { await uiPrompt(msg.text); toast("已回退但取消编辑——原文已弹窗留存，可复制后自行发送", "warn"); }
+        }
+      } else if (isTrulyFirstPair(all, msg.sequence) && !all.qwCapped) {
+        // 首条消息：重置路径（deleteSubChat/createSubChat）不依赖锚点与代系（M7：era 不再作闸——
+        // 首答中断/unknown 的最常见恢复场景不该被误拒）；M1 已给 sequence 形状防御
+        if (!(await uiConfirm({ title: "编辑重发", body: "这是会话的第一条消息。\n「重置」会把现有消息从本会话中删除（磁盘转录文件仍保留作审计），原文将弹出供你编辑后发送。\n\n继续？", confirmText: "重置会话" }))) return;
         btn.textContent = "…";
-        await withLock(sub.id, () => firstTurnReinit({ chatId: chat.id, sub }));
-        savePending({ kind: "edit-draft", text: msg.text, chatId: chat.id });
+        await ensureIdle(sub.id);
+        const newSub = await withLock(sub.id, () => firstTurnReinit({ chatId: chat.id, sub }));
+        savePending({ kind: "edit-draft", text: msg.text, chatId: chat.id, subChatId: newSub, cwd: chatCwd(chat), mode: sub.mode || null });
         await rebindView(chat.id, chat.name || ""); // sub 重建 → 整页重载回本会话；回填由 restorePending 接续
+        return;
+      } else {
+        // 新引擎时代中段（或混代/超长窗口）：公开接口截不了上下文 → 拒绝破坏性动作，仅回填原文
+        await refuseNoAnchor("edit", all, msg.text);
         return;
       }
     } catch (e) {
@@ -810,6 +994,7 @@
       const anchor = anchorBefore(all, userMsg.sequence);
       let targetSub = sub.id, targetChat = chat.id;
       if (anchor) {
+        // M5：锚点即证据（anchorBefore 要求带锚，纯新引擎必 null 落入下方）——跨代会话照常回退
         // 二次确认：回退 + 自动重发是破坏性操作（锚点之后的内容从会话移除），防误点
         if (!(await uiConfirm({ title: "重新生成", body: "将回退到该回答之前并重新生成：\n该回答及之后的内容会从本会话移除（磁盘原文件保留作审计），并用原提问自动重新发送（消耗一次模型调用）。\n\n继续？", confirmText: "回退并重新生成" }))) return;
         btn.textContent = "…";
@@ -820,14 +1005,19 @@
         btn.textContent = "…";
         await sleep(600);
         toast("已回退" + linesMsg(r) + "，重新生成中…");
-      } else {
-        // 第一组对话：无锚点 → 重建 subChat + 自动重发
+      } else if (isTrulyFirstPair(all, userMsg.sequence) && !all.qwCapped) {
+        // 确属第一组对话：重置路径不依赖锚点/代系（M7）→ 重建 subChat + 自动重发
         if (!(await uiConfirm({ title: "重新生成", body: "这是会话的第一组对话。\n「重置」会把现有消息从本会话中删除（磁盘转录文件仍保留作审计），然后用原提问重新生成（消耗一次模型调用）。\n\n继续？", confirmText: "重置并重新生成" }))) return;
         btn.textContent = "…";
+        await ensureIdle(sub.id);
         targetSub = await withLock(sub.id, () => firstTurnReinit({ chatId: chat.id, sub }));
         savePending({ kind: "regen-send", text: userMsg.text, subChatId: targetSub, chatId: targetChat, cwd: chatCwd(chat), mode: sub?.mode || null });
         await rebindView(chat.id, chat.name || ""); // sub 重建 → 整页重载回本会话；重发由 restorePending 接续
         return;
+      } else {
+        // 新引擎时代/混代/超长窗口：截不了上下文 → 拒绝假重新生成，原提问仅回填
+        await refuseNoAnchor("regen", all, userMsg.text);
+        return; // 绝不落到下方的自动重发（未截断上下文时重发＝假重新生成）
       }
       // 用原提问重新发送。锚定回退后【必须】tRPC 直提，不走 composer：
       // 1.2.5 实锤（隔离实验 vs 全链路对比）——composer 提交时客户端会把
@@ -863,10 +1053,23 @@
       const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
       setter.call(composer, text);
       composer.dispatchEvent(new Event("input", { bubbles: true }));
-    } else {
-      composer.textContent = "";
-      document.execCommand("insertText", false, text);
+      return;
     }
+    // 1.4.0 实测：composer 是富文本编辑器 DIV——textContent/execCommand 只改视觉、不进编辑器内部
+    // 模型（发送按钮点了个空 → 建会话壳丢消息）。走编辑器自己的管线：全选 + 合成 paste 事件
+    // （Lexical/Slate/ProseMirror 一类编辑器都实现 onPaste，clipboardData 是它们信任的输入通道）。
+    const sel = window.getSelection();
+    if (sel) {
+      const range = document.createRange();
+      range.selectNodeContents(composer); // 全选现有内容，paste 直接替换（含清掉旧草稿）
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+    const dt = new DataTransfer();
+    dt.setData("text/plain", text);
+    const paste = new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true });
+    composer.dispatchEvent(paste);
+    composer.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertFromPaste", data: text }));
   }
 
   /* 官方输入框发送：回填文本 + 派发 Enter，让渲染层自己发起提交。
@@ -882,9 +1085,18 @@
       if (!composer) return false;
       await fillComposer(text);
       composer.focus();
-      composer.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true,
-      }));
+      // M9：旧代 textarea 优先 Enter（原生行为，无需猜按钮位置）；
+      // 1.4.0 自定义编辑器 Enter 无效（实测），改点 aria-label=发送消息 按钮（与用户点击同路径）
+      if (composer.tagName === "TEXTAREA") {
+        composer.dispatchEvent(new KeyboardEvent("keydown", {
+          key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true,
+        }));
+      } else {
+        const btns = [...document.querySelectorAll("button")];
+        const sb = btns.find((b) => (b.getAttribute("aria-label") || "").match(/发送|send|提交/i))
+          || btns.find((b) => b.type === "submit" && b.closest("form"));
+        if (sb) sb.click();
+      }
       // 验证：官方提交会立刻在目标 subChat 上建立 streamId
       for (let i = 0; i < timeoutMs / 250; i++) {
         await sleep(250);
@@ -906,12 +1118,14 @@
     const p = (n) => String(n).padStart(2, "0");
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   }
-  let timeState = { chatId: null, subId: null, list: null, bubbles: 0, lastReloadAt: 0, untagged: 0 };
+  let timeState = { chatId: null, subId: null, list: null, bubbles: 0, lastReloadAt: 0, untagged: 0, off: undefined };
   async function mountTimes() {
-    const chatId = new URLSearchParams(location.search).get("chat");
+    // 1.5.0 实锤：路由从 ?chat= 查询串改为 hash（location.search 恒空）→ chatId 以侧边栏激活行为权威，
+    // URL 仅作旧版兜底（与编辑/重新生成定位同一来源）
+    const chatId = currentChatId() || new URLSearchParams(location.search).get("chat");
     if (!chatId) return;
     const bubbles = [...document.querySelectorAll('div[class*="container/assistant-message"]')];
-    if (timeState.chatId !== chatId) timeState = { chatId, subId: null, list: null, bubbles: 0, lastReloadAt: 0, untagged: 0 };
+    if (timeState.chatId !== chatId) timeState = { chatId, subId: null, list: null, bubbles: 0, lastReloadAt: 0, untagged: 0, off: undefined };
     if (!timeState.subId) {
       try {
         const det = await chatDetail(chatId);
@@ -931,7 +1145,7 @@
     const staleUntagged = timeState.untagged > 0 && now - timeState.lastReloadAt > 5000;
     if (!timeState.list || timeState.bubbles !== bubbles.length || staleUntagged) {
       try {
-        const list = await loadMessages(subId);
+        const list = await loadMessages(subId, { maxPages: 1 }); // 时间戳只涉已渲染窗口：一页足够，避免后台翻满 50 页（S2）
         // 竞态护栏（与 subId 同款）：await 期间用户可能已切走会话或切换子会话，
         // 此时写入旧列表会覆盖新会话状态 → 校验后丢弃。
         if (timeState.chatId !== chatId || timeState.subId !== subId) return;
@@ -954,13 +1168,67 @@
       if (!hit) { timeState.untagged = 0; return; }
     }
     let untagged = 0;
+    // —— 窗口对齐（存量 bug 修复）：列表是窗口化渲染的，渲染气泡是【整段历史的一个连续窗口】。
+    // 旧版按 assists[i] 位置对齐：滚动/长会话时 渲染下标↔全量下标 错位 → 时间张冠李戴（实锤）。
+    // 新法：气泡渲染文本与消息原文做前缀互含匹配（容忍 处理已结束/深度思考 等渲染前缀噪声），
+    // 以「命中下标 − DOM 下标」的众数估计窗口偏移 O（至少 2 票且过半才采信）；
+    // 对不上则宁缺勿错：不写时间，绝不错写。
+    const key = (s) => norm(s).slice(0, 32);
+    // 气泡渲染文本：优先 whitespace-pre-wrap/p（与 visibleKeys 同款），剥掉我们挂的按钮字样
+    const bubbleRenderText = (b) => {
+      const el = b.querySelector('div[class*="whitespace-pre-wrap"]') || b.querySelector('p') || b;
+      return norm((el.textContent || '')).replace(/\s*(✎ 编辑重发|↻ 重新生成)\s*/g, ' ').trim();
+    };
+    const aKeys = assists.map((a) => key(a.text));
+    // 跳词容错：渲染气泡可能带「处理已结束/深度思考/耗时…」等前缀 chip，
+    // 用气泡文本的每个分词起点与消息原文比公共前缀（≥10 字即算命中）。
+    const cp = (a, b) => { const n = Math.min(a.length, b.length); let i = 0; while (i < n && a[i] === b[i]) i++; return i; };
+    const matchIdx = (kRaw) => {
+      if (!kRaw || kRaw.length < 10) return -1;
+      for (let j = 0; j < aKeys.length; j++) {
+        const ak = aKeys[j];
+        if (!ak || ak.length < 10) continue;
+        if (ak.includes(kRaw.slice(0, 16)) || cp(ak, kRaw) >= 10) return j;
+        // 跳 1~4 个空白分隔的前缀词再比
+        let s = kRaw;
+        for (let w = 0; w < 4; w++) {
+          const sp = s.indexOf(' ');
+          if (sp < 0 || sp > 12) break;
+          s = s.slice(sp + 1);
+          if (s.length < 10) break;
+          if (cp(ak, s) >= 10 || ak.includes(s.slice(0, 16))) return j;
+        }
+      }
+      return -1;
+    };
+    const offs = [];
+    bubbles.forEach((b, i) => {
+      const j = matchIdx(key(bubbleRenderText(b)));
+      if (j >= 0) offs.push(j - i);
+    });
+    let off = -1;
+    if (offs.length) {
+      const cnt = new Map();
+      offs.forEach((o) => cnt.set(o, (cnt.get(o) || 0) + 1));
+      let best;
+      cnt.forEach((v, o) => { if (!best || v > best[1]) best = [o, v]; });
+      if (best[1] >= Math.max(2, Math.ceil(offs.length * 0.6))) off = best[0];
+    }
+    if (off < 0 && bubbles.length === assists.length && timeState.list.length === bubbles.length) off = 0; // 全量渲染的短会话：位置对齐安全
+    // S2（审查）：窗口偏移一旦改变，旧标签是错的——全部清除重打（把最坏情况从"永久错"降为"瞬时错"）。
+    if (timeState.off !== undefined && timeState.off !== off) {
+      document.querySelectorAll('span[data-qw-time]').forEach((el) => el.remove());
+    }
+    timeState.off = off;
     bubbles.forEach((b, i) => {
       if (b.querySelector("[data-qw-time]")) return;
-      const msg = assists[i];
+      const msg = off >= 0 ? assists[i + off] : (bubbles.length === assists.length ? assists[i] : undefined);
+      // off 未估出且列表==气泡（全量渲染的短会话）→ 位置对齐仍安全
       if (!msg) {
         // 列表未覆盖：流式中（未提交，稍后可补拉）或长会话列表被截断（补拉无用）。
-        // 仅当列表未满 200 条（说明是流式中而非截断）才标记补拉，避免长会话无限轮询。
-        if (timeState.list.length < 200) untagged++;
+        // S1（审查）：off<0 是"匹配失败"，重拉同一页不会改变结果 → 不标补拉（防空转轮询）。
+        // 仅当已对齐（off≥0）且列表未满 200（说明是流式中而非截断）才标记补拉。
+        if (off >= 0 && timeState.list.length < 200) untagged++;
         return;
       }
       const t = msg?.createdAt ? fmtTime(msg.createdAt) : "";
@@ -1336,7 +1604,9 @@
   window.__qwEdit = {
     trpc, findMessages, loadMessages, chatDetail, fillComposer,
     trueRollback, ensureIdle, subChatState, pinHits, daemonOp, toast,
+    detectEra, isTrulyFirstPair, anchorBefore,
     uiConfirm, uiPrompt, sendViaComposer,
+    uiEdit, apiSubmit,
     firstTurnReinit, rebindView, sidebarItemsByName, currentChatId,
     trashChat, permanentDeleteChats, openAdminModal, refreshChatCache, looksLikeTest,
     selectUserMsg, scheduleMount,
@@ -1349,16 +1619,22 @@
   function scheduleMount() {
     if (mountScheduled || window.__qwPause) return;
     mountScheduled = true;
+    let executed = false;
     const run = () => {
+      if (executed) return;
+      executed = true;
       try { if (!window.__qwPause) { mountButtons(); void mountTimes(); void mountSidebarDeleteButtons(); mountTrashEntry(); } } catch (e) { console.warn("[qw-edit] mount tick failed:", e); }
       setTimeout(() => { mountScheduled = false; }, 0); // 末尾复位：run 引发的 DOM 变化被 observer 先于此 timer 吞掉，避免冗余空扫
     };
+    // 关键：页面 hidden 时 requestIdleCallback 会【永不触发】（timeout 也失效）——
+    // 只挂在 rIC 会让 mountScheduled 卡 true、后台窗口彻底无按钮（v9.30 实锤教训）。
+    // rIC 仅作前台的降载优化，正确性由 1s 定时器兜底保证。
     if (typeof requestIdleCallback === "function") requestIdleCallback(run, { timeout: 400 });
-    else setTimeout(run, 150);
+    setTimeout(run, 1000);
   }
   try { new MutationObserver(scheduleMount).observe(document.body, { childList: true, subtree: true, characterData: true }); } catch (e) { console.warn("[qw-edit] MutationObserver unavailable:", e); }
   setInterval(() => scheduleMount(), 4000);
   scheduleMount(); // 启动即挂载（否则静止视图上按钮要等 4s 兜底）
   setTimeout(() => { void restorePending(); }, 2000);
-  log("v9.30 loaded (REBUILD + stabilization w/ final check; shared strict selectUserMsg for edit+regen; single currentChatId; verify diagnostic-only; 回收站一键清空; 挂载改 MutationObserver+idle 驱动，修复与 React 重渲染互撕导致的滚动/打开卡顿). 调试入口: window.__qwEdit");
+  log("v9.34 loaded (1.4.0 era-guard: 无锚/混代/超长一律拒绝破坏性操作只回填; 混代判定=最近已完成回答有无锚点; loadMessages 翻页容错+触顶标志+mountTimes 单页; 时间戳窗口偏移对齐修长会话张冠李戴; reinit 前 ensureIdle; hidden 页 rIC 兜底). 调试入口: window.__qwEdit");
 })();
