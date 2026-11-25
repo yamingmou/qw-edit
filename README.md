@@ -109,7 +109,9 @@
 
 在一个不开源、不能改包的客户端上，一个普通用户仍然可以把缺的那一步补上，而且不必承担改坏客户端、弄丢数据的风险。这条路不限于千问办公——任何 Electron 客户端、任何"官方差一步"的需求，都是同一条路。
 
-方法论整理在 [docs/non-invasive-extension.md](./docs/non-invasive-extension.md)（[GitHub 上查看](https://github.com/yamingmou/qw-edit/blob/main/docs/non-invasive-extension.md)，npm 包内不含此文件），可复用的判断清单已沉淀为技能 `electron-client-capability-extension`。
+方法论整理在 [docs/non-invasive-extension.md](./docs/non-invasive-extension.md)（[GitHub 上查看](https://github.com/yamingmou/qw-edit/blob/main/docs/non-invasive-extension.md)），可复用的判断清单已沉淀为技能 `electron-client-capability-extension`。
+
+开发过程本身也留档了：[docs/history.md](./docs/history.md) —— 按时间顺序记下每一次"我以为好了"和"其实没好"，以及它们各自是怎么被发现的。开发期的验证脚本全部保留在 [`tools/`](./tools/README.md)（路径已脱敏），它们是这段过程唯一的原始痕迹。
 
 ## 历史功能（存档，不再维护）
 

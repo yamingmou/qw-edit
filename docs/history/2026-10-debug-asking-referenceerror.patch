@@ -1,0 +1,87 @@
+diff --git a/src/daemon.js b/src/daemon.js
+index 81e9dc9..d067369 100644
+--- a/src/daemon.js
++++ b/src/daemon.js
+@@ -12,7 +12,7 @@
+  */
+ import { readFile, readdir, stat as statFile } from "node:fs/promises";
+ import { execFileSync, spawn } from "node:child_process";
+-import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
++import { appendFileSync, existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
+ import { homedir, tmpdir } from "node:os";
+ import path from "node:path";
+ 
+@@ -128,23 +128,37 @@ function askRestartDialog() {
+   });
+ }
+ 
++const PROBE = "/tmp/qw-ask-probe.log";
++function probe(m) { try { appendFileSync(PROBE, `${Date.now()} ${m}\n`); } catch {} }
+ async function maybeAskTakeover() {
+-  if (!config.takeover || failedTakeovers >= (config.maxFailedTakeovers ?? 3)) return;
++  probe("E0 entered");
++  const dbg = (m, extra) => console.log(`[dbg] ${m}`, extra ?? "");
++  probe("E1 before config guard");
++  if (!config.takeover || failedTakeovers >= (config.maxFailedTakeovers ?? 3)) return dbg("bail: takeover off / failed>=3", failedTakeovers);
++  probe("E2 before appPids");
+   let pids = appPids();
+-  if (!pids.length || (await cdpUp())) return;
++  probe("E3 pids=" + pids.length);
++  if (!pids.length) return dbg("bail: no pids");
++  probe("E4 before cdpUp await");
++  if (await cdpUp()) return dbg("bail: cdpUp TRUE");
++  probe("E5 after cdpUp");
+   const uptime = Math.min(...pids.map(appUptime));
+-  if (uptime < 4) return;                             // 刚启动，稍等
+-  if (Date.now() - lastRelaunchAt < 30_000) return;   // 防风暴
++  probe("E6 uptime=" + uptime);
++  if (uptime < 4) return dbg("bail: uptime<4", uptime);
++  probe("E7 before cooldown check");
++  if (Date.now() - lastRelaunchAt < 30_000) return dbg("bail: 30s cooldown", Date.now() - lastRelaunchAt);
++  probe("E8 after cooldown");
+   const key = runKey(pids);
+   // asked.json 清理：超过 30 天的记录过期（防无限增长）
+   const nowTs = Date.now();
+   for (const k of Object.keys(askedRuns)) {
+     if (nowTs - askedRuns[k] > 30 * 24 * 3600 * 1000) delete askedRuns[k];
+   }
+-  if (askedRuns[key]) return;                         // 本次运行已问过/已拒绝，尊重用户
+-  if (asking) return;
++  if (askedRuns[key]) return dbg("bail: already asked", key.slice(0, 30));
++  if (asking) return dbg("bail: asking in flight");
+   asking = true;
+   try {
++    dbg("PASS → 弹询问框");
+     log(`客户端已运行 ${uptime}s 但无 CDP 端口，询问用户是否重启加载…`);
+     const yes = await askRestartDialog();
+     askedRuns[key] = Date.now(); askedFileWrite();    // 无论选什么，本次运行不再问
+@@ -374,6 +388,8 @@ async function main() {
+   setInterval(async () => {
+     try {
+       const up = await cdpUp();
++      const pidsNow = appPids();
++      console.log("[dbg-tick] up=", up, "pids=", pidsNow.length, pidsNow.join(",") || "(空)");
+       if (up) {
+         cdpDownSince = 0;
+         for (const t of await listTargets()) {
+@@ -382,8 +398,10 @@ async function main() {
+         }
+       } else {
+         // CDP 没起来：要么 app 没跑，要么需要询问重启，要么正处重启间隙
+-        if (appPids().length) {
++        if (pidsNow.length) {
++          probe("before-call pids=" + pidsNow.join(","));
+           await maybeAskTakeover();
++          probe("after-call");
+           cdpDownSince = 0; // app 还在，继续守
+         } else if (cdpDownSince === 0) {
+           cdpDownSince = Date.now();
+@@ -392,7 +410,7 @@ async function main() {
+           process.exit(0);
+         }
+       }
+-    } catch { /* 静默重试 */ }
++    } catch (e) { log("loop error:", e?.stack?.split("\n").slice(0, 3).join(" | ") || String(e)); }
+   }, POLL_MS);
+ }
+ main();
